@@ -54,7 +54,7 @@ func (p *APIKeyPolicy) Mode() policy.ProcessingMode {
 
 // OnRequest performs API Key Authentication
 func (p *APIKeyPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
-	slog.info("Thushani")
+	slog.Info("Thushani")
 	return nil
 }
 
