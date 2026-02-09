@@ -34,8 +34,11 @@ const (
 	MetadataKeyAuthSuccess = "auth.success"
 	MetadataKeyAuthMethod  = "auth.method"
 
-	// AuthContext key for auth status
+	// AuthContext keys
 	AuthContextKeyAuthSuccess = "x-wso2-auth-success"
+	AuthContextKeyCreatedBy   = "x-wso2-key-created-by"
+	AuthContextKeyKeyName     = "x-wso2-key-name"
+	AuthContextKeyKeySource   = "x-wso2-key-source"
 )
 
 // APIKeyPolicy implements API Key Authentication
@@ -158,7 +161,7 @@ func (p *APIKeyPolicy) OnRequest(ctx *policy.RequestContext, params map[string]i
 	)
 
 	// API key was provided - validate it using external validation
-	isValid, err := p.validateAPIKey(apiId, apiOperation, operationMethod, providedKey)
+	isValid, apiKeyDetails, err := p.validateAPIKey(apiId, apiOperation, operationMethod, providedKey)
 	if err != nil {
 		slog.Debug("API Key Auth Policy: Validation error",
 			"error", err,
@@ -174,11 +177,11 @@ func (p *APIKeyPolicy) OnRequest(ctx *policy.RequestContext, params map[string]i
 
 	// Authentication successful
 	slog.Debug("API Key Auth Policy: Authentication successful")
-	return p.handleAuthSuccess(ctx)
+	return p.handleAuthSuccess(ctx, apiKeyDetails)
 }
 
 // handleAuthSuccess handles successful authentication
-func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext) policy.RequestAction {
+func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext, apiKeyDetails *store.APIKey) policy.RequestAction {
 	slog.Debug("API Key Auth Policy: handleAuthSuccess called",
 		"apiId", ctx.APIId,
 		"apiName", ctx.APIName,
@@ -199,8 +202,24 @@ func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext) policy.Requ
 	// Set auth success status in AuthContext for analytics
 	ctx.SharedContext.AuthContext[AuthContextKeyAuthSuccess] = "true"
 
-	slog.Debug("API Key Auth Policy: Set auth status in AuthContext",
+	// Set API key details in AuthContext
+	if apiKeyDetails != nil {
+		if apiKeyDetails.CreatedBy != "" {
+			ctx.SharedContext.AuthContext[AuthContextKeyCreatedBy] = apiKeyDetails.CreatedBy
+		}
+		if apiKeyDetails.Name != "" {
+			ctx.SharedContext.AuthContext[AuthContextKeyKeyName] = apiKeyDetails.Name
+		}
+		if apiKeyDetails.Source != "" {
+			ctx.SharedContext.AuthContext[AuthContextKeyKeySource] = apiKeyDetails.Source
+		}
+	}
+
+	slog.Debug("API Key Auth Policy: Set auth context",
 		"authSuccess", "true",
+		"createdBy", apiKeyDetails.CreatedBy,
+		"keyName", apiKeyDetails.Name,
+		"keySource", apiKeyDetails.Source,
 	)
 
 	// Continue to upstream with no modifications
@@ -271,13 +290,13 @@ func (p *APIKeyPolicy) handleAuthFailure(ctx *policy.RequestContext, statusCode 
 }
 
 // validateAPIKey validates the provided API key against external store/service
-func (p *APIKeyPolicy) validateAPIKey(apiId, apiOperation, operationMethod, apiKey string) (bool, error) {
+func (p *APIKeyPolicy) validateAPIKey(apiId, apiOperation, operationMethod, apiKey string) (bool, *store.APIKey, error) {
 	apiKeyStore := store.GetAPIkeyStoreInstance()
-	isValid, err := apiKeyStore.ValidateAPIKey(apiId, apiOperation, operationMethod, apiKey)
+	isValid, apiKeyDetails, err := apiKeyStore.ValidateAPIKeyWithDetails(apiId, apiOperation, operationMethod, apiKey)
 	if err != nil {
-		return false, fmt.Errorf("failed to validate API key via the policy engine")
+		return false, nil, fmt.Errorf("failed to validate API key via the policy engine")
 	}
-	return isValid, nil
+	return isValid, apiKeyDetails, nil
 }
 
 // extractQueryParam extracts the first value of the given query parameter from the request path
