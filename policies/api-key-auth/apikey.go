@@ -213,14 +213,14 @@ func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext, apiKeyDetai
 		if apiKeyDetails.Source != "" {
 			ctx.SharedContext.AuthContext[AuthContextKeyKeySource] = apiKeyDetails.Source
 		}
-	}
 
-	slog.Debug("API Key Auth Policy: Set auth context",
-		"authSuccess", "true",
-		"createdBy", apiKeyDetails.CreatedBy,
-		"keyName", apiKeyDetails.Name,
-		"keySource", apiKeyDetails.Source,
-	)
+		slog.Debug("API Key Auth Policy: Set auth context",
+			"authSuccess", "true",
+			"createdBy", apiKeyDetails.CreatedBy,
+			"keyName", apiKeyDetails.Name,
+			"keySource", apiKeyDetails.Source,
+		)
+	}
 
 	// Continue to upstream with no modifications
 	return policy.UpstreamRequestModifications{}
