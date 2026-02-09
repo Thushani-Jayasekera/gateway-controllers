@@ -292,7 +292,7 @@ func (p *APIKeyPolicy) handleAuthFailure(ctx *policy.RequestContext, statusCode 
 // validateAPIKey validates the provided API key against external store/service
 func (p *APIKeyPolicy) validateAPIKey(apiId, apiOperation, operationMethod, apiKey string) (bool, *store.APIKey, error) {
 	apiKeyStore := store.GetAPIkeyStoreInstance()
-	isValid, apiKeyDetails, err := apiKeyStore.ValidateAPIKeyWithDetails(apiId, apiOperation, operationMethod, apiKey)
+	isValid, apiKeyDetails, err := apiKeyStore.ValidateAPIKey(apiId, apiOperation, operationMethod, apiKey)
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to validate API key via the policy engine")
 	}
