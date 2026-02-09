@@ -33,6 +33,9 @@ const (
 	// Metadata keys for context storage
 	MetadataKeyAuthSuccess = "auth.success"
 	MetadataKeyAuthMethod  = "auth.method"
+
+	// AuthContext key for auth status
+	AuthContextKeyAuthSuccess = "x-wso2-auth-success"
 )
 
 // APIKeyPolicy implements API Key Authentication
@@ -193,6 +196,13 @@ func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext) policy.Requ
 		"authMethod", "api-key",
 	)
 
+	// Set auth success status in AuthContext for analytics
+	ctx.SharedContext.AuthContext[AuthContextKeyAuthSuccess] = "true"
+
+	slog.Debug("API Key Auth Policy: Set auth status in AuthContext",
+		"authSuccess", "true",
+	)
+
 	// Continue to upstream with no modifications
 	return policy.UpstreamRequestModifications{}
 }
@@ -220,6 +230,13 @@ func (p *APIKeyPolicy) handleAuthFailure(ctx *policy.RequestContext, statusCode 
 	// Set metadata indicating failed authentication
 	ctx.Metadata[MetadataKeyAuthSuccess] = false
 	ctx.Metadata[MetadataKeyAuthMethod] = "api-key"
+
+	// Set auth failure status in AuthContext for analytics
+	ctx.SharedContext.AuthContext[AuthContextKeyAuthSuccess] = "false"
+
+	slog.Debug("API Key Auth Policy: Set auth failure in AuthContext",
+		"authSuccess", "false",
+	)
 
 	headers := map[string]string{
 		"content-type": "application/json",
