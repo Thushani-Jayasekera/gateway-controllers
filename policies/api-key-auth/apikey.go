@@ -33,13 +33,11 @@ const (
 	// Metadata keys for context storage
 	MetadataKeyAuthSuccess = "auth.success"
 	MetadataKeyAuthMethod  = "auth.method"
-
-	// AuthContext keys
-	AuthContextKeyAuthSuccess = "x-wso2-auth-success"
-	AuthContextKeyCreatedBy   = "x-wso2-key-created-by"
-	AuthContextKeyKeyName     = "x-wso2-key-name"
-	AuthContextKeyKeySource   = "x-wso2-key-source"
+	MetadataKeyAuthKeySource = "auth.keySource"
+	MetadataKeyAuthCreatedBy = "auth.createdBy"
+	MetadataKeyAuthKeyName = "auth.keyName"
 )
+
 
 // APIKeyPolicy implements API Key Authentication
 type APIKeyPolicy struct {
@@ -199,19 +197,16 @@ func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext, apiKeyDetai
 		"authMethod", "api-key",
 	)
 
-	// Set auth success status in AuthContext for analytics
-	ctx.SharedContext.AuthContext[AuthContextKeyAuthSuccess] = "true"
-
 	// Set API key details in AuthContext
 	if apiKeyDetails != nil {
 		if apiKeyDetails.CreatedBy != "" {
-			ctx.SharedContext.AuthContext[AuthContextKeyCreatedBy] = apiKeyDetails.CreatedBy
+			ctx.Metadata[MetadataKeyAuthCreatedBy] = apiKeyDetails.CreatedBy
 		}
 		if apiKeyDetails.Name != "" {
-			ctx.SharedContext.AuthContext[AuthContextKeyKeyName] = apiKeyDetails.Name
+			ctx.Metadata[MetadataKeyAuthKeyName] = apiKeyDetails.Name
 		}
 		if apiKeyDetails.Source != "" {
-			ctx.SharedContext.AuthContext[AuthContextKeyKeySource] = apiKeyDetails.Source
+			ctx.Metadata[MetadataKeyAuthKeySource] = apiKeyDetails.Source
 		}
 
 		slog.Debug("API Key Auth Policy: Set auth context",
@@ -249,9 +244,6 @@ func (p *APIKeyPolicy) handleAuthFailure(ctx *policy.RequestContext, statusCode 
 	// Set metadata indicating failed authentication
 	ctx.Metadata[MetadataKeyAuthSuccess] = false
 	ctx.Metadata[MetadataKeyAuthMethod] = "api-key"
-
-	// Set auth failure status in AuthContext for analytics
-	ctx.SharedContext.AuthContext[AuthContextKeyAuthSuccess] = "false"
 
 	slog.Debug("API Key Auth Policy: Set auth failure in AuthContext",
 		"authSuccess", "false",
