@@ -31,13 +31,10 @@ import (
 
 const (
 	// Metadata keys for context storage
-	MetadataKeyAuthSuccess = "auth.success"
-	MetadataKeyAuthMethod  = "auth.method"
-	MetadataKeyAuthKeySource = "auth.keySource"
-	MetadataKeyAuthCreatedBy = "auth.createdBy"
-	MetadataKeyAuthKeyName = "auth.keyName"
+	APIKeyCredentialID = "apikey:credential_id"
+	APIKeyKeySource    = "apikey:key_source"
+	APIKeyCreatedBy    = "apikey:created_by"
 )
-
 
 // APIKeyPolicy implements API Key Authentication
 type APIKeyPolicy struct {
@@ -189,30 +186,30 @@ func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext, apiKeyDetai
 	)
 
 	// Set metadata indicating successful authentication
-	ctx.Metadata[MetadataKeyAuthSuccess] = true
-	ctx.Metadata[MetadataKeyAuthMethod] = "api-key"
 
-	slog.Debug("API Key Auth Policy: Authentication metadata set",
-		"authSuccess", true,
-		"authMethod", "api-key",
-	)
+	// Populate typed AuthContext
+	ctx.SharedContext.AuthContext.Authenticated = true
+	ctx.SharedContext.AuthContext.AuthType = "api-key"
 
-	// Set API key details in AuthContext
+	// Set API key details in Metadata and AuthContext
 	if apiKeyDetails != nil {
-		if apiKeyDetails.CreatedBy != "" {
-			ctx.Metadata[MetadataKeyAuthCreatedBy] = apiKeyDetails.CreatedBy
-		}
 		if apiKeyDetails.Name != "" {
-			ctx.Metadata[MetadataKeyAuthKeyName] = apiKeyDetails.Name
+			ctx.SharedContext.AuthContext.Properties[APIKeyCredentialID] = apiKeyDetails.Name
+			ctx.SharedContext.AuthContext.CredentialID = apiKeyDetails.Name
+		}
+		if apiKeyDetails.CreatedBy != "" {
+			ctx.SharedContext.AuthContext.Properties[APIKeyCreatedBy] = apiKeyDetails.CreatedBy
+			ctx.SharedContext.AuthContext.UserID = apiKeyDetails.CreatedBy
 		}
 		if apiKeyDetails.Source != "" {
-			ctx.Metadata[MetadataKeyAuthKeySource] = apiKeyDetails.Source
+			ctx.SharedContext.AuthContext.Properties[APIKeyKeySource] = apiKeyDetails.Source
 		}
 
 		slog.Debug("API Key Auth Policy: Set auth context",
 			"authSuccess", "true",
+			"authType", "apikey",
+			"credentialId", apiKeyDetails.Name,
 			"createdBy", apiKeyDetails.CreatedBy,
-			"keyName", apiKeyDetails.Name,
 			"keySource", apiKeyDetails.Source,
 		)
 	}
@@ -241,12 +238,12 @@ func (p *APIKeyPolicy) handleAuthFailure(ctx *policy.RequestContext, statusCode 
 		"path", ctx.Path,
 	)
 
-	// Set metadata indicating failed authentication
-	ctx.Metadata[MetadataKeyAuthSuccess] = false
-	ctx.Metadata[MetadataKeyAuthMethod] = "api-key"
+	// Populate typed AuthContext for failed authentication
+	ctx.SharedContext.AuthContext.Authenticated = false
+	ctx.SharedContext.AuthContext.AuthType = "api-key"
 
 	slog.Debug("API Key Auth Policy: Set auth failure in AuthContext",
-		"authSuccess", "false",
+		"authSuccess", "false", "authType", "api-key",
 	)
 
 	headers := map[string]string{

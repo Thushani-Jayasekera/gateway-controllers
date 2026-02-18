@@ -47,9 +47,6 @@ const (
 	MetadataKeySubject      = "auth.subject"
 	MetadataValidatedClaims = "auth.validatedClaims"
 
-	// AuthContext key for user ID (used for analytics)
-	AuthContextKeyUserID = "x-wso2-user-id"
-
 	// Default claim to extract user ID from
 	DefaultUserIdClaim = "sub"
 )
@@ -1298,12 +1295,19 @@ func (p *JwtAuthPolicy) handleAuthSuccess(ctx *policy.RequestContext, claims jwt
 		)
 	}
 
-	// Extract user ID from the specified claim and set it in AuthContext for analytics
+	// Populate typed AuthContext for downstream policies and analytics
+	ctx.SharedContext.AuthContext.Authenticated = true
+	ctx.SharedContext.AuthContext.AuthType = "jwt"
+	if iss, ok := claims["iss"].(string); ok {
+		ctx.SharedContext.AuthContext.Issuer = iss
+	}
+
+	// Extract user ID from the specified claim and set it in AuthContext
 	if userIdClaim != "" {
 		if claimValue, exists := claims[userIdClaim]; exists {
 			userId := claimValueToString(claimValue)
 			if userId != "" {
-				ctx.SharedContext.AuthContext[AuthContextKeyUserID] = userId
+				ctx.SharedContext.AuthContext.UserID = userId
 				slog.Debug("JWT Auth Policy: Set user ID in AuthContext",
 					"claim", userIdClaim,
 					"userId", userId,
