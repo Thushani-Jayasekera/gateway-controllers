@@ -59,23 +59,8 @@ func (p *APIKeyPolicy) Mode() policy.ProcessingMode {
 
 // OnRequest performs API Key Authentication
 func (p *APIKeyPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
-	slog.Debug("API Key Auth Policy: OnRequest started",
-		"path", ctx.Path,
-		"method", ctx.Method,
-		"apiId", ctx.APIId,
-		"apiName", ctx.APIName,
-		"apiVersion", ctx.APIVersion,
-	)
-
-	// Get configuration parameters
-	keyName, ok := params["key"].(string)
-	if !ok || keyName == "" {
-		slog.Debug("API Key Auth Policy: Missing or invalid 'key' configuration",
-			"keyName", keyName,
-			"ok", ok,
-		)
-		return p.handleAuthFailure(ctx, 401, "json", "Valid API key required",
-			"missing or invalid 'key' configuration")
+	if errResp := p.authenticate(ctx.SharedContext, ctx.Headers, ctx.Path, ctx.Method, params); errResp != nil {
+		return *errResp
 	}
 
 	location, ok := params["in"].(string)
@@ -89,6 +74,7 @@ func (p *APIKeyPolicy) OnRequest(ctx *policy.RequestContext, params map[string]i
 	}
 
 	issuer, _ := params["issuer"].(string)
+	keyName, ok := params["key"].(string)
 
 	slog.Debug("API Key Auth Policy: Configuration loaded",
 		"keyName", keyName,
@@ -222,9 +208,127 @@ func (p *APIKeyPolicy) handleAuthFailure(ctx *policy.RequestContext, statusCode 
 		Previous:      ctx.SharedContext.AuthContext,
 	}
 
-	headers := map[string]string{
-		"content-type": "application/json",
+	return p.buildErrorResponse(statusCode, errorFormat, errorMessage, reason)
+}
+
+// authenticate is the shared core logic for both OnRequest and OnRequestHeaders.
+// It extracts and validates the API key, sets SharedContext.AuthContext, and returns
+// nil on success or an *ImmediateResponse on failure.
+func (p *APIKeyPolicy) authenticate(
+	shared *policy.SharedContext,
+	headers *policy.Headers,
+	path, method string,
+	params map[string]interface{},
+) *policy.ImmediateResponse {
+	slog.Debug("API Key Auth Policy: authenticate started",
+		"path", path,
+		"method", method,
+		"apiId", shared.APIId,
+		"apiName", shared.APIName,
+		"apiVersion", shared.APIVersion,
+	)
+
+	keyName, ok := params["key"].(string)
+	if !ok || keyName == "" {
+		slog.Debug("API Key Auth Policy: Missing or invalid 'key' configuration")
+		return p.failAuth(shared, 401, "json", "Valid API key required",
+			"missing or invalid 'key' configuration")
 	}
+
+	location, ok := params["in"].(string)
+	if !ok || location == "" {
+		slog.Debug("API Key Auth Policy: Missing or invalid 'in' configuration")
+		return p.failAuth(shared, 401, "json", "Valid API key required",
+			"missing or invalid 'in' configuration")
+	}
+
+	issuer, ok := params["issuer"].(string)
+	if !ok || issuer == "" {
+		slog.Debug("API Key Auth Policy: Missing or invalid 'issuer' configuration")
+		return p.failAuth(shared, 401, "json", "Valid API key required",
+			"missing or invalid 'issuer' configuration")
+	}
+
+	slog.Debug("API Key Auth Policy: Configuration loaded", "keyName", keyName, "location", location)
+
+	var providedKey string
+	switch location {
+	case "header":
+		if vals := headers.Get(http.CanonicalHeaderKey(keyName)); len(vals) > 0 {
+			providedKey = vals[0]
+			slog.Debug("API Key Auth Policy: Found API key in header",
+				"headerName", keyName, "keyLength", len(providedKey))
+		}
+	case "query":
+		providedKey = extractQueryParam(path, keyName)
+		if providedKey != "" {
+			slog.Debug("API Key Auth Policy: Found API key in query parameter",
+				"paramName", keyName, "keyLength", len(providedKey))
+		}
+	default:
+		slog.Debug("API Key Auth Policy: Unsupported location", "location", location)
+		return p.failAuth(shared, 401, "json", "Valid API key required",
+			"missing or invalid 'in' configuration")
+	}
+
+	if providedKey == "" {
+		slog.Debug("API Key Auth Policy: No API key found", "location", location, "keyName", keyName)
+		return p.failAuth(shared, 401, "json", "Valid API key required", "missing API key")
+	}
+
+	apiId := shared.APIId
+	apiName := shared.APIName
+	apiVersion := shared.APIVersion
+	apiOperation := shared.OperationPath
+	operationMethod := method
+
+	if apiId == "" || apiName == "" || apiVersion == "" || apiOperation == "" || operationMethod == "" {
+		slog.Debug("API Key Auth Policy: Missing API details for validation",
+			"apiId", apiId, "apiName", apiName, "apiVersion", apiVersion,
+			"apiOperation", apiOperation, "operationMethod", operationMethod)
+		return p.failAuth(shared, 401, "json", "Valid API key required",
+			"missing API details for validation")
+	}
+
+	slog.Debug("API Key Auth Policy: Starting validation",
+		"apiId", apiId, "apiName", apiName, "apiVersion", apiVersion,
+		"apiOperation", apiOperation, "operationMethod", operationMethod,
+		"keyLength", len(providedKey))
+
+	isValid, err := p.validateAPIKey(apiId, apiOperation, operationMethod, providedKey, issuer)
+	if err != nil {
+		slog.Debug("API Key Auth Policy: Validation error", "error", err)
+		return p.failAuth(shared, 401, "json", "Valid API key required",
+			"error validating API key")
+	}
+	if !isValid {
+		slog.Debug("API Key Auth Policy: Invalid API key")
+		return p.failAuth(shared, 401, "json", "Valid API key required", "invalid API key")
+	}
+
+	slog.Debug("API Key Auth Policy: Authentication successful")
+	shared.AuthContext = &policy.AuthContext{
+		Authenticated: true,
+		AuthType:      AuthType,
+		Previous:      shared.AuthContext,
+	}
+	return nil
+}
+
+// failAuth sets the auth context to unauthenticated and returns an ImmediateResponse.
+func (p *APIKeyPolicy) failAuth(shared *policy.SharedContext, statusCode int, errorFormat, errorMessage, reason string) *policy.ImmediateResponse {
+	shared.AuthContext = &policy.AuthContext{
+		Authenticated: false,
+		AuthType:      AuthType,
+		Previous:      shared.AuthContext,
+	}
+	resp := p.buildErrorResponse(statusCode, errorFormat, errorMessage, reason)
+	return &resp
+}
+
+// buildErrorResponse constructs the ImmediateResponse body and headers for an auth failure.
+func (p *APIKeyPolicy) buildErrorResponse(statusCode int, errorFormat, errorMessage, reason string) policy.ImmediateResponse {
+	headers := map[string]string{"content-type": "application/json"}
 
 	var body string
 	switch errorFormat {
@@ -263,6 +367,20 @@ func (p *APIKeyPolicy) validateAPIKey(apiId, apiOperation, operationMethod, apiK
 	}
 	return isValid, nil
 }
+
+// ─── v2alpha.RequestHeaderPolicy ─────────────────────────────────────────────
+
+// OnRequestHeaders implements v2alpha.RequestHeaderPolicy.
+// It performs API key authentication in the request-header phase, allowing the
+// kernel to short-circuit before any body buffering occurs.
+func (p *APIKeyPolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	if errResp := p.authenticate(ctx.SharedContext, ctx.Headers, ctx.Path, ctx.Method, params); errResp != nil {
+		return *errResp
+	}
+	return policy.UpstreamRequestHeaderModifications{}
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 // extractQueryParam extracts the first value of the given query parameter from the request path
 func extractQueryParam(path, param string) string {

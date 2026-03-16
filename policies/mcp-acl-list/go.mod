@@ -2,9 +2,6 @@ module github.com/wso2/gateway-controllers/policies/mcp-acl-list
 
 go 1.25.1
 
-require github.com/wso2/api-platform/sdk v0.3.7
+require github.com/wso2/api-platform/sdk v0.5.0
 
-require (
-	golang.org/x/crypto v0.46.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
-)
+replace github.com/wso2/api-platform/sdk => github.com/Thushani-Jayasekera/api-platform/sdk v0.5.0

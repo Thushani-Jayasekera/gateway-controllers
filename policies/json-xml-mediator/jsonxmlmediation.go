@@ -15,12 +15,36 @@
  *
  */
 
+// Package jsonxmlmediation converts request and response payloads between JSON and XML.
+//
+// ─── Design Notes ─────────────────────────────────────────────────────────────
+//
+// 1. BUFFERED CONVERSION
+//    JSON↔XML conversion requires the complete body before it can produce valid
+//    output. This policy always buffers the full request or response body before
+//    converting.
+//
+// 2. STREAMING / SSE RESPONSES
+//    SSE responses (stream: true) are passed through unchanged and a warning is
+//    logged. When an LLM streams, the buffered body consists of
+//    chat.completion.chunk events whose delta-based structure cannot be
+//    losslessly reconstructed into the full chat.completion JSON that a
+//    non-streaming call returns. To use this policy for JSON↔XML conversion,
+//    call the upstream with stream: false so that a single, complete JSON
+//    document is returned.
+//
+// 3. INTERFACE LAYOUT
+//    v1alpha.Policy (monolithic): Mode / OnRequest / OnResponse
+//    v1alpha.RequestPolicy:       OnRequestBody(ctx) — convert request body
+//    v1alpha.ResponsePolicy:      OnResponseBody(ctx) — convert response body;
+//                                 passes SSE bodies through with a warning
 package jsonxmlmediation
 
 import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"unicode"
@@ -31,6 +55,10 @@ import (
 const (
 	upstreamPayloadFormatXML  = "xml"
 	upstreamPayloadFormatJSON = "json"
+
+	// sseDataPrefix is the line prefix used in Server-Sent Events payloads.
+	// Used only for detection — SSE bodies are passed through without conversion.
+	sseDataPrefix = "data: "
 )
 
 // JSONXMLMediationPolicy mediates request/response payloads between JSON and XML.
@@ -62,34 +90,42 @@ func GetPolicy(
 	}, nil
 }
 
-// Mode returns the processing mode for this policy.
+// ─── v1alpha.Policy (monolithic) ─────────────────────────────────────────────
+
+// Mode declares that this policy requires both request and response body buffering.
 func (p *JSONXMLMediationPolicy) Mode() policy.ProcessingMode {
 	return policy.ProcessingMode{
-		RequestHeaderMode:  policy.HeaderModeProcess,
-		RequestBodyMode:    policy.BodyModeBuffer,
-		ResponseHeaderMode: policy.HeaderModeProcess,
-		ResponseBodyMode:   policy.BodyModeBuffer,
+		RequestBodyMode:  policy.BodyModeBuffer,
+		ResponseBodyMode: policy.BodyModeBuffer,
 	}
 }
 
-// OnRequest applies conversion to match the configured upstream payload format.
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *JSONXMLMediationPolicy) OnRequest(ctx *policy.RequestContext, _ map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
+func (p *JSONXMLMediationPolicy) OnResponse(ctx *policy.ResponseContext, _ map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// ─── v1alpha.RequestPolicy ────────────────────────────────────────────────────
+
+// OnRequestBody converts the request body from the downstream payload format to
+// the upstream payload format before forwarding to the upstream service.
+func (p *JSONXMLMediationPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if ctx.Body == nil || !ctx.Body.Present || len(ctx.Body.Content) == 0 {
 		return policy.UpstreamRequestModifications{}
 	}
 
 	contentType := getFirstHeader(ctx.Headers, "content-type")
-
 	if !matchesContentType(contentType, p.downstreamPayloadFormat) {
 		return p.handleInternalServerError(fmt.Sprintf(
 			"Content-Type must be %s for downstream payload format %s",
 			expectedContentTypeMessage(p.downstreamPayloadFormat),
 			p.downstreamPayloadFormat,
 		))
-	}
-
-	if p.downstreamPayloadFormat == p.upstreamPayloadFormat {
-		return policy.UpstreamRequestModifications{}
 	}
 
 	convertedBody, convertedContentType, convErr := p.convertBetweenFormats(
@@ -110,24 +146,37 @@ func (p *JSONXMLMediationPolicy) OnRequest(ctx *policy.RequestContext, _ map[str
 	}
 }
 
-// OnResponse mediates the upstream response to the configured downstream payload format.
-func (p *JSONXMLMediationPolicy) OnResponse(ctx *policy.ResponseContext, _ map[string]interface{}) policy.ResponseAction {
+// ─── v1alpha.ResponsePolicy ───────────────────────────────────────────────────
+
+// OnResponseBody converts the upstream response body to the downstream payload
+// format.
+//
+// SSE (streaming) responses are passed through unchanged with a warning.
+// Conversion requires a complete, non-streaming JSON or XML document — use
+// stream: false on the upstream request to ensure a full body is returned.
+func (p *JSONXMLMediationPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if ctx.ResponseBody == nil || !ctx.ResponseBody.Present || len(ctx.ResponseBody.Content) == 0 {
 		return policy.UpstreamResponseModifications{}
 	}
 
-	contentType := getFirstHeader(ctx.ResponseHeaders, "content-type")
+	// SSE (streaming) responses cannot be converted: the buffered body contains
+	// chat.completion.chunk events with delta fields, which have a fundamentally
+	// different structure from the full chat.completion JSON returned by
+	// non-streaming calls. Pass through and warn so operators know to disable
+	// streaming if they need format conversion.
+	if isSSEResponse(string(ctx.ResponseBody.Content)) {
+		slog.Warn("json-xml-mediator: SSE response detected — passing through without conversion. " +
+			"Set stream: false on the upstream request to enable JSON↔XML mediation.")
+		return policy.UpstreamResponseModifications{}
+	}
 
+	contentType := getFirstHeader(ctx.ResponseHeaders, "content-type")
 	if !matchesContentType(contentType, p.upstreamPayloadFormat) {
 		return p.handleInternalServerErrorResponse(fmt.Sprintf(
 			"Content-Type must be %s in response for upstream payload format %s",
 			expectedContentTypeMessage(p.upstreamPayloadFormat),
 			p.upstreamPayloadFormat,
 		))
-	}
-
-	if p.upstreamPayloadFormat == p.downstreamPayloadFormat {
-		return policy.UpstreamResponseModifications{}
 	}
 
 	convertedBody, convertedContentType, convErr := p.convertBetweenFormats(
@@ -148,86 +197,20 @@ func (p *JSONXMLMediationPolicy) OnResponse(ctx *policy.ResponseContext, _ map[s
 	}
 }
 
-func getUpstreamPayloadFormat(params map[string]interface{}) (string, error) {
-	upstreamPayloadFormat, _, err := getPayloadFormat(params, "upstreamPayloadFormat", true)
-	return upstreamPayloadFormat, err
-}
+// ─── SSE detection ────────────────────────────────────────────────────────────
 
-func getDownstreamPayloadFormat(params map[string]interface{}) (string, error) {
-	downstreamPayloadFormat, _, err := getPayloadFormat(params, "downsteamPayloadFormat", true)
-	return downstreamPayloadFormat, err
-}
-
-func getPayloadFormat(params map[string]interface{}, key string, required bool) (string, bool, error) {
-	if params == nil {
-		if required {
-			return "", false, fmt.Errorf("Invalid policy configuration: %s must be a non-empty string", key)
+// isSSEResponse reports whether the body looks like a Server-Sent Events
+// payload by checking for a "data: " prefix in the first few lines.
+func isSSEResponse(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
 		}
-		return "", false, nil
 	}
-
-	payloadFormatRaw, ok := params[key]
-	if !ok {
-		if required {
-			return "", false, fmt.Errorf("Invalid policy configuration: %s must be a non-empty string", key)
-		}
-		return "", false, nil
-	}
-
-	payloadFormat, ok := payloadFormatRaw.(string)
-	if !ok || strings.TrimSpace(payloadFormat) == "" {
-		return "", true, fmt.Errorf("Invalid policy configuration: %s must be a non-empty string", key)
-	}
-
-	normalized := strings.ToLower(strings.TrimSpace(payloadFormat))
-	if normalized != upstreamPayloadFormatXML && normalized != upstreamPayloadFormatJSON {
-		return "", true, fmt.Errorf("Invalid policy configuration: %s must be one of [xml, json]", key)
-	}
-
-	return normalized, true, nil
+	return false
 }
 
-func getFirstHeader(headers *policy.Headers, key string) string {
-	if headers == nil {
-		return ""
-	}
-
-	vals := headers.Get(key)
-	if len(vals) == 0 {
-		return ""
-	}
-
-	return strings.ToLower(vals[0])
-}
-
-func matchesContentType(contentType, payloadFormat string) bool {
-	switch payloadFormat {
-	case upstreamPayloadFormatXML:
-		return strings.Contains(contentType, "application/xml") || strings.Contains(contentType, "text/xml")
-	case upstreamPayloadFormatJSON:
-		return strings.Contains(contentType, "application/json")
-	default:
-		return false
-	}
-}
-
-func expectedContentTypeMessage(payloadFormat string) string {
-	switch payloadFormat {
-	case upstreamPayloadFormatXML:
-		return "application/xml or text/xml"
-	case upstreamPayloadFormatJSON:
-		return "application/json"
-	default:
-		return "a supported content type"
-	}
-}
-
-func canonicalContentType(payloadFormat string) string {
-	if payloadFormat == upstreamPayloadFormatXML {
-		return "application/xml"
-	}
-	return "application/json"
-}
+// ─── Conversion ───────────────────────────────────────────────────────────────
 
 func (p *JSONXMLMediationPolicy) convertBetweenFormats(body []byte, sourceFormat, targetFormat string) ([]byte, string, error) {
 	switch {
@@ -282,6 +265,91 @@ func (p *JSONXMLMediationPolicy) handleInternalServerErrorResponse(message strin
 		},
 	}
 }
+
+// ─── Parameter parsing ────────────────────────────────────────────────────────
+
+func getUpstreamPayloadFormat(params map[string]interface{}) (string, error) {
+	upstreamPayloadFormat, _, err := getPayloadFormat(params, "upstreamPayloadFormat", true)
+	return upstreamPayloadFormat, err
+}
+
+func getDownstreamPayloadFormat(params map[string]interface{}) (string, error) {
+	downstreamPayloadFormat, _, err := getPayloadFormat(params, "downsteamPayloadFormat", true)
+	return downstreamPayloadFormat, err
+}
+
+func getPayloadFormat(params map[string]interface{}, key string, required bool) (string, bool, error) {
+	if params == nil {
+		if required {
+			return "", false, fmt.Errorf("Invalid policy configuration: %s must be a non-empty string", key)
+		}
+		return "", false, nil
+	}
+
+	payloadFormatRaw, ok := params[key]
+	if !ok {
+		if required {
+			return "", false, fmt.Errorf("Invalid policy configuration: %s must be a non-empty string", key)
+		}
+		return "", false, nil
+	}
+
+	payloadFormat, ok := payloadFormatRaw.(string)
+	if !ok || strings.TrimSpace(payloadFormat) == "" {
+		return "", true, fmt.Errorf("Invalid policy configuration: %s must be a non-empty string", key)
+	}
+
+	normalized := strings.ToLower(strings.TrimSpace(payloadFormat))
+	if normalized != upstreamPayloadFormatXML && normalized != upstreamPayloadFormatJSON {
+		return "", true, fmt.Errorf("Invalid policy configuration: %s must be one of [xml, json]", key)
+	}
+
+	return normalized, true, nil
+}
+
+// ─── Header helpers ───────────────────────────────────────────────────────────
+
+func getFirstHeader(headers *policy.Headers, key string) string {
+	if headers == nil {
+		return ""
+	}
+	vals := headers.Get(key)
+	if len(vals) == 0 {
+		return ""
+	}
+	return strings.ToLower(vals[0])
+}
+
+func matchesContentType(contentType, payloadFormat string) bool {
+	switch payloadFormat {
+	case upstreamPayloadFormatXML:
+		return strings.Contains(contentType, "application/xml") || strings.Contains(contentType, "text/xml")
+	case upstreamPayloadFormatJSON:
+		return strings.Contains(contentType, "application/json")
+	default:
+		return false
+	}
+}
+
+func expectedContentTypeMessage(payloadFormat string) string {
+	switch payloadFormat {
+	case upstreamPayloadFormatXML:
+		return "application/xml or text/xml"
+	case upstreamPayloadFormatJSON:
+		return "application/json"
+	default:
+		return "a supported content type"
+	}
+}
+
+func canonicalContentType(payloadFormat string) string {
+	if payloadFormat == upstreamPayloadFormatXML {
+		return "application/xml"
+	}
+	return "application/json"
+}
+
+// ─── JSON → XML conversion ────────────────────────────────────────────────────
 
 func (p *JSONXMLMediationPolicy) convertJSONBytesToXML(body []byte) ([]byte, error) {
 	var jsonData interface{}
@@ -385,6 +453,8 @@ func isValidNCNameChar(r rune) bool {
 		unicode.IsLetter(r)
 }
 
+// ─── XML → JSON conversion ────────────────────────────────────────────────────
+
 func (p *JSONXMLMediationPolicy) convertXMLToJSON(xmlData []byte) ([]byte, error) {
 	var node XMLNode
 	err := xml.Unmarshal(xmlData, &node)
@@ -483,6 +553,8 @@ func (p *JSONXMLMediationPolicy) parseValue(value string) interface{} {
 
 	return value
 }
+
+// ─── XML types ────────────────────────────────────────────────────────────────
 
 // XMLElement represents a generic XML element for marshaling.
 type XMLElement struct {
