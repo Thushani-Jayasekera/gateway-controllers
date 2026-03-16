@@ -37,6 +37,9 @@ const (
 	DefaultResponseJSONPath      = "$.choices[0].message.content"
 	RequestFlowEnabledByDefault  = true
 	ResponseFlowEnabledByDefault = false
+
+	sseDataPrefix = "data: "
+	sseDone       = "[DONE]"
 )
 
 var (
@@ -241,8 +244,18 @@ func (p *WordCountGuardrailPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest validates request body word count
-func (p *WordCountGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
+func (p *WordCountGuardrailPolicy) OnRequest(ctx *policy.RequestContext, _ map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
+func (p *WordCountGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, _ map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnRequestBody validates the word count of the request body.
+func (p *WordCountGuardrailPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !p.hasRequestParams || !p.requestParams.Enabled {
 		return policy.UpstreamRequestModifications{}
 	}
@@ -254,8 +267,13 @@ func (p *WordCountGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params 
 	return p.validatePayload(content, p.requestParams, false).(policy.RequestAction)
 }
 
-// OnResponse validates response body word count
-func (p *WordCountGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+// OnResponseBody validates the word count of the response body.
+//
+// SSE (stream: true) responses are also handled here. Because Mode() declares
+// BodyModeBuffer, the kernel fully buffers the entire SSE body before calling
+// this method — response headers are not yet committed, so a normal 422 error
+// response can still be returned (no SSE error-event workaround needed).
+func (p *WordCountGuardrailPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
 		return policy.UpstreamResponseModifications{}
 	}
@@ -264,7 +282,77 @@ func (p *WordCountGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, param
 	if ctx.ResponseBody != nil {
 		content = ctx.ResponseBody.Content
 	}
+
+	// For SSE responses, reconstruct the full assistant text from delta events
+	// and count words on that, bypassing the JSONPath extraction (which targets
+	// the non-streaming response structure).
+	if text := extractSSEDeltaContent(string(content)); text != "" {
+		return p.validateWordCount(text, p.responseParams, true)
+	}
+
 	return p.validatePayload(content, p.responseParams, true).(policy.ResponseAction)
+}
+
+// extractSSEDeltaContent concatenates choices[*].delta.content values from
+// every complete SSE data line in s. Returns "" for non-SSE content.
+func extractSSEDeltaContent(s string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			continue
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue
+		}
+		choices, _ := data["choices"].([]interface{})
+		for _, cr := range choices {
+			choice, _ := cr.(map[string]interface{})
+			delta, _ := choice["delta"].(map[string]interface{})
+			content, _ := delta["content"].(string)
+			sb.WriteString(content)
+		}
+	}
+	return sb.String()
+}
+
+// validateWordCount counts words in text and validates against params.
+func (p *WordCountGuardrailPolicy) validateWordCount(text string, params WordCountGuardrailPolicyParams, isResponse bool) policy.ResponseAction {
+	text = textCleanRegexCompiled.ReplaceAllString(text, "")
+	text = strings.TrimSpace(text)
+
+	words := wordSplitRegexCompiled.Split(text, -1)
+	wordCount := 0
+	for _, w := range words {
+		if w != "" {
+			wordCount++
+		}
+	}
+
+	isWithinRange := wordCount >= params.Min && wordCount <= params.Max
+	validationPassed := isWithinRange
+	if params.Invert {
+		validationPassed = !isWithinRange
+	}
+
+	if !validationPassed {
+		var reason string
+		if params.Invert {
+			reason = fmt.Sprintf("word count %d is within the excluded range %d-%d words", wordCount, params.Min, params.Max)
+		} else {
+			reason = fmt.Sprintf("word count %d is outside the allowed range %d-%d words", wordCount, params.Min, params.Max)
+		}
+		slog.Debug("WordCountGuardrail: validation failed",
+			"wordCount", wordCount, "min", params.Min, "max", params.Max, "invert", params.Invert)
+		return p.buildErrorResponse(reason, nil, isResponse, params.ShowAssessment, params.Min, params.Max).(policy.ResponseAction)
+	}
+
+	return policy.UpstreamResponseModifications{}
 }
 
 // validatePayload validates payload word count

@@ -42,11 +42,17 @@ const (
 	DefaultResponseJSONPath      = "$.choices[0].message.content"
 	RequestFlowEnabledByDefault  = false
 	ResponseFlowEnabledByDefault = true
+
+	sseDataPrefix = "data: "
+	sseDone       = "[DONE]"
 )
 
 var (
 	textCleanRegexCompiled = regexp.MustCompile(TextCleanRegex)
 	urlRegexCompiled       = regexp.MustCompile(URLRegex)
+	// partialURLAtEnd matches an http(s):// prefix at the end of a string with
+	// no trailing whitespace — indicating a URL that is still being streamed.
+	partialURLAtEnd = regexp.MustCompile(`https?://[^\s]*$`)
 )
 
 // URLGuardrailPolicy implements URL validation guardrail
@@ -208,8 +214,18 @@ func (p *URLGuardrailPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest validates URLs in request body
-func (p *URLGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
+func (p *URLGuardrailPolicy) OnRequest(ctx *policy.RequestContext, _ map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
+func (p *URLGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, _ map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnRequestBody validates URLs found in the request body.
+func (p *URLGuardrailPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !p.hasRequestParams || !p.requestParams.Enabled {
 		return policy.UpstreamRequestModifications{}
 	}
@@ -221,8 +237,8 @@ func (p *URLGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params map[st
 	return p.validatePayload(content, p.requestParams, false).(policy.RequestAction)
 }
 
-// OnResponse validates URLs in response body
-func (p *URLGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+// OnResponseBody validates URLs found in the response body.
+func (p *URLGuardrailPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
 		return policy.UpstreamResponseModifications{}
 	}
@@ -232,6 +248,153 @@ func (p *URLGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, params map[
 		content = ctx.ResponseBody.Content
 	}
 	return p.validatePayload(content, p.responseParams, true).(policy.ResponseAction)
+}
+
+// ─── Streaming (SSE) support ──────────────────────────────────────────────────
+//
+// LLM responses with stream: true arrive as SSE events. Headers (and status)
+// are committed before any chunk reaches the policy, so ImmediateResponse
+// cannot be used here. If an invalid URL is found the offending chunk is
+// replaced with an SSE error event so the downstream client knows the guardrail
+// intervened.
+//
+// Non-SSE streaming bodies are passed through — the buffered OnResponseBody
+// already handles them when the kernel falls back to full buffering.
+
+// NeedsMoreResponseData controls how SSE chunks are accumulated before
+// OnResponseBodyChunk is called. The goal is to ensure a URL is never
+// validated while it is still being streamed token-by-token.
+//
+// Decision logic (evaluated in order):
+//
+//  1. Policy disabled → false (pass every chunk through immediately).
+//
+//  2. data: [DONE] present → false (stream is over; process whatever is
+//     accumulated, even if a URL looks incomplete at the very end).
+//
+//  3. No SSE delta content extracted → false (non-SSE body; the buffered
+//     OnResponseBody will handle it when the kernel falls back to full
+//     buffering, so there is nothing for the streaming path to do here).
+//
+//  4. Accumulated delta content ends with `https?://[^\s]*` (a URL that
+//     has started but has no whitespace after it yet) → true (keep
+//     accumulating; the URL tail is still arriving in subsequent tokens).
+//
+//  5. Otherwise → false (all URLs in the current window are
+//     whitespace-terminated and safe to validate).
+func (p *URLGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return false
+	}
+
+	s := string(accumulated)
+
+	if strings.Contains(s, sseDataPrefix+sseDone) {
+		return false
+	}
+
+	content := extractSSEDeltaContent(s)
+	if content == "" {
+		return false
+	}
+
+	return partialURLAtEnd.MatchString(content)
+}
+
+// OnResponseBodyChunk validates URLs in the accumulated SSE delta content.
+// Called once NeedsMoreResponseData returns false (URL complete or stream done).
+// On success the original chunk is passed through unchanged (nil Body).
+// On failure the chunk is replaced with a structured SSE error event because
+// ImmediateResponse is not available after response headers are committed.
+func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx *policy.ResponseStreamContext, chunk *policy.StreamBody, _ map[string]interface{}) policy.ResponseChunkAction {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return policy.ResponseChunkAction{}
+	}
+	if chunk == nil || len(chunk.Chunk) == 0 {
+		return policy.ResponseChunkAction{}
+	}
+
+	chunkStr := string(chunk.Chunk)
+
+	// Only validate SSE content; non-SSE chunks are passed through.
+	if !strings.Contains(chunkStr, sseDataPrefix) {
+		return policy.ResponseChunkAction{}
+	}
+
+	content := extractSSEDeltaContent(chunkStr)
+	content = textCleanRegexCompiled.ReplaceAllString(content, "")
+	content = strings.TrimSpace(content)
+
+	urls := urlRegexCompiled.FindAllString(content, -1)
+	if len(urls) == 0 {
+		return policy.ResponseChunkAction{} // no URLs — pass through
+	}
+
+	invalidURLs := make([]string, 0)
+	for _, urlStr := range urls {
+		var isValid bool
+		if p.responseParams.OnlyDNS {
+			isValid = p.checkDNS(urlStr, p.responseParams.Timeout)
+		} else {
+			isValid = p.checkURL(urlStr, p.responseParams.Timeout)
+		}
+		if !isValid {
+			invalidURLs = append(invalidURLs, urlStr)
+		}
+	}
+
+	if len(invalidURLs) > 0 {
+		slog.Debug("URLGuardrail: streaming validation failed",
+			"invalidURLCount", len(invalidURLs), "totalURLCount", len(urls))
+		return policy.ResponseChunkAction{
+			Body: p.buildSSEErrorEvent(invalidURLs, p.responseParams.ShowAssessment),
+		}
+	}
+
+	return policy.ResponseChunkAction{} // all URLs valid — pass through
+}
+
+// extractSSEDeltaContent concatenates choices[*].delta.content values from
+// every complete SSE data line in s. Returns "" for non-SSE content.
+func extractSSEDeltaContent(s string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			continue
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue // partial or malformed line
+		}
+		choices, _ := data["choices"].([]interface{})
+		for _, cr := range choices {
+			choice, _ := cr.(map[string]interface{})
+			delta, _ := choice["delta"].(map[string]interface{})
+			content, _ := delta["content"].(string)
+			sb.WriteString(content)
+		}
+	}
+	return sb.String()
+}
+
+// buildSSEErrorEvent formats a guardrail intervention as a single SSE data
+// event, replacing the offending chunk in the stream.
+func (p *URLGuardrailPolicy) buildSSEErrorEvent(invalidURLs []string, showAssessment bool) []byte {
+	assessment := p.buildAssessmentObject("Violation of url validity detected", nil, true, showAssessment, invalidURLs)
+	responseBody := map[string]interface{}{
+		"type":    "URL_GUARDRAIL",
+		"message": assessment,
+	}
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(`{"type":"URL_GUARDRAIL","message":"Internal error"}`)
+	}
+	return []byte(sseDataPrefix + string(bodyBytes) + "\n\n")
 }
 
 // validatePayload validates URLs in payload

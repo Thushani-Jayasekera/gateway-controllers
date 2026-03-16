@@ -2,4 +2,6 @@ module github.com/wso2/gateway-controllers/policies/dynamic-endpoint
 
 go 1.25.7
 
-require github.com/wso2/api-platform/sdk v0.4.2
+require github.com/wso2/api-platform/sdk v0.5.0
+
+replace github.com/wso2/api-platform/sdk => github.com/Thushani-Jayasekera/api-platform/sdk v0.5.0

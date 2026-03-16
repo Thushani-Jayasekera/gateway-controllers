@@ -209,10 +209,22 @@ func (p *PIIMaskingRegexPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest masks PII in request body
-func (p *PIIMaskingRegexPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
+func (p *PIIMaskingRegexPolicy) OnRequest(ctx *policy.RequestContext, _ map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
+func (p *PIIMaskingRegexPolicy) OnResponse(ctx *policy.ResponseContext, _ map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnRequestBody masks PII in the request body before forwarding to upstream.
+// Placeholders (e.g. [EMAIL_0000]) or redaction markers (*****) replace
+// detected PII. Placeholder→original mappings are stored in shared metadata
+// so OnResponseBody can restore them.
+func (p *PIIMaskingRegexPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if len(p.params.PIIEntities) == 0 {
-		// No PII entities configured, pass through
 		return policy.UpstreamRequestModifications{}
 	}
 
@@ -221,29 +233,24 @@ func (p *PIIMaskingRegexPolicy) OnRequest(ctx *policy.RequestContext, params map
 	}
 	payload := ctx.Body.Content
 
-	// Extract value using JSONPath
 	extractedValue, err := utils.ExtractStringValueFromJsonpath(payload, p.params.JsonPath)
 	if err != nil {
 		return p.buildErrorResponse(fmt.Sprintf("error extracting value from JSONPath: %v", err)).(policy.RequestAction)
 	}
 
-	// Clean and trim
 	extractedValue = textCleanRegexCompiled.ReplaceAllString(extractedValue, "")
 	extractedValue = strings.TrimSpace(extractedValue)
 
 	var modifiedContent string
 	if p.params.RedactPII {
-		// Redaction mode: replace with *****
 		modifiedContent = p.redactPIIFromContent(extractedValue, p.params.PIIEntities)
 	} else {
-		// Masking mode: replace with placeholders and store mappings
 		modifiedContent, err = p.maskPIIFromContent(extractedValue, p.params.PIIEntities, ctx.Metadata)
 		if err != nil {
 			return p.buildErrorResponse(fmt.Sprintf("error masking PII: %v", err)).(policy.RequestAction)
 		}
 	}
 
-	// If content was modified, update the payload
 	if modifiedContent != "" && modifiedContent != extractedValue {
 		modifiedPayload := p.updatePayloadWithMaskedContent(payload, extractedValue, modifiedContent, p.params.JsonPath)
 		return policy.UpstreamRequestModifications{
@@ -254,14 +261,22 @@ func (p *PIIMaskingRegexPolicy) OnRequest(ctx *policy.RequestContext, params map
 	return policy.UpstreamRequestModifications{}
 }
 
-// OnResponse restores PII in response body (if redactPII is false)
-func (p *PIIMaskingRegexPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
-	// If redactPII is true, no restoration needed
+// OnResponseBody restores PII placeholders in the upstream response.
+//
+// When redactPII is true there is nothing to restore — the response is passed
+// through unchanged.
+//
+// SSE (stream: true) responses are also handled here. Because Mode() declares
+// BodyModeBuffer the kernel fully buffers the entire SSE body before calling
+// this method, so placeholders are restored inside each SSE event's
+// delta.content field and the reassembled SSE body is returned. No streaming
+// chunk interfaces are needed — placeholder restoration is a simple text
+// substitution that does not require partial results.
+func (p *PIIMaskingRegexPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if p.params.RedactPII {
 		return policy.UpstreamResponseModifications{}
 	}
 
-	// Check if PII entities were masked in request
 	maskedPII, exists := ctx.Metadata[MetadataKeyPIIEntities]
 	if !exists {
 		return policy.UpstreamResponseModifications{}
@@ -277,7 +292,16 @@ func (p *PIIMaskingRegexPolicy) OnResponse(ctx *policy.ResponseContext, params m
 	}
 	payload := ctx.ResponseBody.Content
 
-	// Restore PII in response
+	// SSE response: restore placeholders inside each event's delta.content and
+	// return the reassembled SSE body so the client still receives SSE format.
+	if isSSEContent(string(payload)) {
+		restored := p.restorePIIInSSEBody(payload, maskedPIIMap)
+		if string(restored) != string(payload) {
+			return policy.UpstreamResponseModifications{Body: restored}
+		}
+		return policy.UpstreamResponseModifications{}
+	}
+
 	restoredContent := p.restorePIIInResponse(string(payload), maskedPIIMap)
 	if restoredContent != string(payload) {
 		return policy.UpstreamResponseModifications{
@@ -286,6 +310,58 @@ func (p *PIIMaskingRegexPolicy) OnResponse(ctx *policy.ResponseContext, params m
 	}
 
 	return policy.UpstreamResponseModifications{}
+}
+
+// isSSEContent reports whether the body looks like a Server-Sent Events
+// payload by checking for a "data: " prefix in the first few lines.
+func isSSEContent(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, "data: ") {
+			return true
+		}
+	}
+	return false
+}
+
+// restorePIIInSSEBody restores PII placeholders inside the delta.content field
+// of each SSE event, then reassembles and returns the full SSE body.
+func (p *PIIMaskingRegexPolicy) restorePIIInSSEBody(body []byte, maskedPIIMap map[string]string) []byte {
+	var sb strings.Builder
+	for _, line := range strings.Split(string(body), "\n") {
+		trimmed := strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(trimmed, "data: ") {
+			sb.WriteString(line + "\n")
+			continue
+		}
+		jsonStr := strings.TrimPrefix(trimmed, "data: ")
+		if jsonStr == "[DONE]" {
+			sb.WriteString(line + "\n")
+			continue
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			sb.WriteString(line + "\n")
+			continue
+		}
+		if choices, ok := data["choices"].([]interface{}); ok {
+			for _, cr := range choices {
+				if choice, ok := cr.(map[string]interface{}); ok {
+					if delta, ok := choice["delta"].(map[string]interface{}); ok {
+						if content, ok := delta["content"].(string); ok {
+							delta["content"] = p.restorePIIInResponse(content, maskedPIIMap)
+						}
+					}
+				}
+			}
+		}
+		modifiedJSON, err := json.Marshal(data)
+		if err != nil {
+			sb.WriteString(line + "\n")
+			continue
+		}
+		sb.WriteString("data: " + string(modifiedJSON) + "\n")
+	}
+	return []byte(sb.String())
 }
 
 // maskPIIFromContent masks PII from content using regex patterns
