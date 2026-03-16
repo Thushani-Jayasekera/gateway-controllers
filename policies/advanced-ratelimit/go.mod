@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/advanced-ratelimit
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/advanced-ratelimit
 
 go 1.25.1
 

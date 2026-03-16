@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/sentence-count-guardrail
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/sentence-count-guardrail
 
 go 1.25.1
 

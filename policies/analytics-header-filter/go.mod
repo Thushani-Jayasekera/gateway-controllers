@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/analytics-header-filter
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/analytics-header-filter
 
 go 1.25.1
 

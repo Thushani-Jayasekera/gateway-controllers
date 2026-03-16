@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/api-key-auth
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/api-key-auth
 
 go 1.25.1
 

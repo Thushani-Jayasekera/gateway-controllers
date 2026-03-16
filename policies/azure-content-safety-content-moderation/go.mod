@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/azure-content-safety-content-moderation
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/azure-content-safety-content-moderation
 
 go 1.25.1
 

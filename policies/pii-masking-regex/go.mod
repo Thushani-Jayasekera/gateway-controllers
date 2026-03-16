@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/pii-masking-regex
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/pii-masking-regex
 
 go 1.25.1
 

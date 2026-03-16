@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/prompt-template
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/prompt-template
 
 go 1.25.1
 

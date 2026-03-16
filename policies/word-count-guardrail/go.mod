@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/word-count-guardrail
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/word-count-guardrail
 
 go 1.25.1
 

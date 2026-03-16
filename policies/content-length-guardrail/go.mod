@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/content-length-guardrail
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/content-length-guardrail
 
 go 1.25.1
 

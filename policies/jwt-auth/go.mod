@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/jwt-auth
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/jwt-auth
 
 go 1.25.1
 

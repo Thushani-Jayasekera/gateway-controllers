@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/mcp-rewrite
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/mcp-rewrite
 
 go 1.25.1
 
