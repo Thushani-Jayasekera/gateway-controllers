@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/remove-headers
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/remove-headers
 
 go 1.25.1
 

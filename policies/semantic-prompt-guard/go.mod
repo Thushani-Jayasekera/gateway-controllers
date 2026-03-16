@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/semantic-prompt-guard
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/semantic-prompt-guard
 
 go 1.25.1
 

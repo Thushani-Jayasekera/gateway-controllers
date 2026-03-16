@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/basic-ratelimit
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/basic-ratelimit
 
 go 1.25.1
 

@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/url-guardrail
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/url-guardrail
 
 go 1.25.1
 

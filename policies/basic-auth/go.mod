@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/basic-auth
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/basic-auth
 
 go 1.25.1
 

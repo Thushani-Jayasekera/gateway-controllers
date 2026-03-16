@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/json-xml-mediator
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/json-xml-mediator
 
 go 1.25.1
 

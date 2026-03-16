@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/respond
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/respond
 
 go 1.25.1
 

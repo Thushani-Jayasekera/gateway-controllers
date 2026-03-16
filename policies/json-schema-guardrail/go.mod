@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/json-schema-guardrail
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/json-schema-guardrail
 
 go 1.25.1
 

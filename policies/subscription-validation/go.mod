@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/subscription-validation
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/subscription-validation
 
 go 1.25.1
 

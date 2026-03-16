@@ -1,4 +1,4 @@
-module github.com/wso2/gateway-controllers/policies/prompt-decorator
+module github.com/Thushani-Jayasekera/gateway-controllers/policies/prompt-decorator
 
 go 1.25.1
 
