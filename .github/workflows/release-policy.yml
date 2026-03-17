@@ -64,16 +64,9 @@ jobs:
 
           POLICY="${{ github.event.inputs.policy }}"
           VERSION="${{ github.event.inputs.version }}"
-          MAJOR="${VERSION%%.*}"
 
-          if [[ "$MAJOR" == "0" || "$MAJOR" == "1" ]]; then
-            TARGET_DIR="policies/$POLICY"
-            MODULE_PATH="github.com/${{ github.repository }}/policies/$POLICY"
-          else
-            TARGET_DIR="policies/$POLICY/v$MAJOR"
-            MODULE_PATH="github.com/${{ github.repository }}/policies/$POLICY/v$MAJOR"
-          fi
-
+          TARGET_DIR="policies/$POLICY"
+          MODULE_PATH="github.com/${{ github.repository }}/policies/$POLICY"
           TAG_NAME="policies/$POLICY/v$VERSION"
 
           echo "target_dir=$TARGET_DIR" >> "$GITHUB_OUTPUT"
