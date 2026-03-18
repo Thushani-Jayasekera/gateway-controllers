@@ -258,7 +258,7 @@ func TestPIIMaskingRegexPolicy_OnResponse_RestoreMaskedPII(t *testing.T) {
 			RequestID: "req-id",
 			Metadata: map[string]interface{}{
 				MetadataKeyPIIEntities: map[string]string{
-					"a.user@example.com": "[EMAIL_0000]",
+					"[EMAIL_0000]": "a.user@example.com",
 				},
 			},
 		},
