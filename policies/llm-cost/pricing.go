@@ -248,9 +248,12 @@ type providerCalculator interface {
 	Adjust(baseCost float64, usage Usage, pricing ModelPricing) float64
 }
 
-// selectCalculator returns the appropriate calculator for a given provider value.
+// selectCalculator returns the appropriate calculator for a given provider value,
+// or nil if the provider is not supported.
 func selectCalculator(provider string) providerCalculator {
 	switch provider {
+	case "openai":
+		return &OpenAICalculator{}
 	case "anthropic":
 		return &AnthropicCalculator{}
 	case "gemini",
@@ -263,8 +266,8 @@ func selectCalculator(provider string) providerCalculator {
 		return &GeminiCalculator{}
 	case "mistral":
 		return &MistralCalculator{}
-	default: // "openai", "text-completion-openai"
-		return &OpenAICalculator{}
+	default:
+		return nil
 	}
 }
 
