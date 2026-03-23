@@ -37,6 +37,10 @@ const (
 	DefaultResponseJSONPath      = "$.choices[0].message.content"
 	RequestFlowEnabledByDefault  = true
 	ResponseFlowEnabledByDefault = false
+
+	sseDataPrefix     = "data: "
+	sseDone           = "[DONE]"
+	metaKeyAccContent = "sentencecountguardrail:accumulated_content"
 )
 
 var (
@@ -241,8 +245,13 @@ func (p *SentenceCountGuardrailPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest validates request body sentence count
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *SentenceCountGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody validates request body sentence count.
+func (p *SentenceCountGuardrailPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !p.hasRequestParams || !p.requestParams.Enabled {
 		return policy.UpstreamRequestModifications{}
 	}
@@ -255,7 +264,13 @@ func (p *SentenceCountGuardrailPolicy) OnRequest(ctx *policy.RequestContext, par
 }
 
 // OnResponse validates response body sentence count
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *SentenceCountGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody validates response body sentence count.
+func (p *SentenceCountGuardrailPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
 		return policy.UpstreamResponseModifications{}
 	}
@@ -452,4 +467,172 @@ func (p *SentenceCountGuardrailPolicy) buildAssessmentObject(reason string, vali
 	}
 
 	return assessment
+}
+
+// ─── Streaming (SSE) support ──────────────────────────────────────────────────
+//
+// NeedsMoreResponseData and OnResponseBodyChunk together implement
+// StreamingResponsePolicy using a gate-then-stream approach (modelled on the
+// pii-masking reference implementation).
+//
+// NeedsMoreResponseData returns true to silently buffer chunks in the kernel
+// (no bytes sent to the client) until the gate condition is satisfied:
+//   - Normal mode (invert=false): buffer until sentence count >= min.
+//   - Invert mode (invert=true):  buffer until sentence count > max.
+//   - Always flush when [DONE] arrives for final validation.
+//
+// Once flushed, OnResponseBodyChunk receives the full accumulated batch.
+// It tracks a running total in ctx.Metadata (across all flush windows) for
+// accurate max enforcement and final [DONE] validation.
+
+// NeedsMoreResponseData implements StreamingResponsePolicy.
+// Returns true to keep accumulating in the kernel until the gate condition is
+// satisfied, suppressing all output to the client during that phase.
+func (p *SentenceCountGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return false
+	}
+	s := string(accumulated)
+	if !isSSEChunk(s) {
+		return false
+	}
+	// Always flush on [DONE] so OnResponseBodyChunk can do final validation.
+	if strings.Contains(s, sseDataPrefix+sseDone) {
+		return false
+	}
+	content := extractSSEDeltaContent(s)
+	count := countSentences(content)
+	rp := p.responseParams
+	if rp.Invert {
+		// Invert mode: buffer while still within or below the excluded range.
+		return count <= rp.Max
+	}
+	// Normal mode: buffer while below the required minimum.
+	return count < rp.Min
+}
+
+// OnResponseBodyChunk implements StreamingResponsePolicy.
+// Receives flushed batches from the kernel accumulator and validates them.
+// ctx.Metadata tracks the full accumulated text across windows for accuracy.
+func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return policy.ResponseChunkAction{}
+	}
+	if chunk == nil || len(chunk.Chunk) == 0 {
+		return policy.ResponseChunkAction{}
+	}
+	chunkStr := string(chunk.Chunk)
+	if !isSSEChunk(chunkStr) {
+		return policy.ResponseChunkAction{}
+	}
+
+	rp := p.responseParams
+
+	// Append this batch's delta content to the running total stored in metadata
+	// so that countSentences always operates on the full text seen so far,
+	// avoiding off-by-one errors at flush-window boundaries.
+	prev := ""
+	if v, ok := ctx.Metadata[metaKeyAccContent]; ok {
+		if s, ok := v.(string); ok {
+			prev = s
+		}
+	}
+	fullContent := prev + extractSSEDeltaContent(chunkStr)
+	ctx.Metadata[metaKeyAccContent] = fullContent
+	count := countSentences(fullContent)
+	isDone := strings.Contains(chunkStr, sseDataPrefix+sseDone)
+
+	if !rp.Invert {
+		// Normal mode: max violation at any point, or below min at [DONE].
+		if rp.Max > 0 && count > rp.Max {
+			slog.Debug("SentenceCountGuardrail: max exceeded",
+				"count", count, "max", rp.Max, "chunkIndex", chunk.Index)
+			reason := fmt.Sprintf("sentence count %d exceeded maximum of %d sentences", count, rp.Max)
+			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+		}
+		if isDone && count < rp.Min {
+			slog.Debug("SentenceCountGuardrail: below min at stream end",
+				"count", count, "min", rp.Min, "chunkIndex", chunk.Index)
+			reason := fmt.Sprintf("sentence count %d is below minimum of %d sentences", count, rp.Min)
+			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+		}
+		return policy.ResponseChunkAction{}
+	}
+
+	// Invert mode: at [DONE], check if count falls within the excluded range.
+	if isDone {
+		if count >= rp.Min && count <= rp.Max {
+			slog.Debug("SentenceCountGuardrail: invert violation at stream end",
+				"count", count, "min", rp.Min, "max", rp.Max, "chunkIndex", chunk.Index)
+			reason := fmt.Sprintf("sentence count %d is within the excluded range %d-%d sentences", count, rp.Min, rp.Max)
+			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+		}
+	}
+	return policy.ResponseChunkAction{}
+}
+
+// isSSEChunk reports whether s contains at least one "data: " SSE line.
+func isSSEChunk(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractSSEDeltaContent concatenates choices[*].delta.content values from
+// every complete SSE data line in s. Returns "" for non-SSE or empty content.
+func extractSSEDeltaContent(s string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			continue
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue
+		}
+		choices, _ := data["choices"].([]interface{})
+		for _, cr := range choices {
+			choice, _ := cr.(map[string]interface{})
+			delta, _ := choice["delta"].(map[string]interface{})
+			content, _ := delta["content"].(string)
+			sb.WriteString(content)
+		}
+	}
+	return sb.String()
+}
+
+// countSentences counts non-empty sentence segments in accumulated text.
+func countSentences(text string) int {
+	text = textCleanRegexCompiled.ReplaceAllString(text, "")
+	text = strings.TrimSpace(text)
+	sentences := sentenceSplitRegexCompiled.Split(text, -1)
+	count := 0
+	for _, s := range sentences {
+		if strings.TrimSpace(s) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+// buildSSEErrorEvent formats a guardrail intervention as a single SSE data event.
+func (p *SentenceCountGuardrailPolicy) buildSSEErrorEvent(reason string, rp SentenceCountGuardrailPolicyParams) []byte {
+	assessment := p.buildAssessmentObject(reason, nil, true, rp.ShowAssessment, rp.Min, rp.Max)
+	responseBody := map[string]interface{}{
+		"type":    "SENTENCE_COUNT_GUARDRAIL",
+		"message": assessment,
+	}
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(`{"type":"SENTENCE_COUNT_GUARDRAIL","message":"Internal error"}`)
+	}
+	return []byte(sseDataPrefix + string(bodyBytes) + "\n\n")
 }

@@ -191,8 +191,13 @@ func (p *PromptDecoratorPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest decorates request body
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *PromptDecoratorPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody decorates request body.
+func (p *PromptDecoratorPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	var content []byte
 	if ctx.Body != nil {
 		content = ctx.Body.Content

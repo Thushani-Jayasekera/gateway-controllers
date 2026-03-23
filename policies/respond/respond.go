@@ -73,6 +73,82 @@ func (p *RespondPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
+// OnRequestHeaders returns an immediate response to the client in the request header phase.
+func (p *RespondPolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	statusCode := defaultStatusCode
+	if statusCodeRaw, ok := params["statusCode"]; ok {
+		parsedStatusCode, err := parseStatusCode(statusCodeRaw)
+		if err != nil {
+			return configError(err.Error())
+		}
+		statusCode = parsedStatusCode
+	}
+
+	body := []byte{}
+	if bodyRaw, ok := params["body"]; ok {
+		bodyString, ok := bodyRaw.(string)
+		if !ok {
+			return configError("body must be a string")
+		}
+		body = []byte(bodyString)
+	}
+
+	headers := make(map[string]string)
+	if headersRaw, ok := params["headers"]; ok {
+		headersList, ok := headersRaw.([]interface{})
+		if !ok {
+			return configError("headers must be an array")
+		}
+		for i, headerRaw := range headersList {
+			headerMap, ok := headerRaw.(map[string]interface{})
+			if !ok {
+				return configError(fmt.Sprintf("headers[%d] must be an object", i))
+			}
+			if err := validateHeaderObjectKeys(headerMap, i); err != nil {
+				return configError(err.Error())
+			}
+
+			nameRaw, ok := headerMap["name"]
+			if !ok {
+				return configError(fmt.Sprintf("headers[%d] missing required 'name' field", i))
+			}
+			name, ok := nameRaw.(string)
+			if !ok {
+				return configError(fmt.Sprintf("headers[%d].name must be a string", i))
+			}
+			if name == "" {
+				return configError(fmt.Sprintf("headers[%d].name cannot be empty", i))
+			}
+			if len(name) > headerNameMaxLen {
+				return configError(fmt.Sprintf("headers[%d].name must not exceed %d characters", i, headerNameMaxLen))
+			}
+			if !headerNamePattern.MatchString(name) {
+				return configError(fmt.Sprintf("headers[%d].name contains invalid characters", i))
+			}
+
+			valueRaw, ok := headerMap["value"]
+			if !ok {
+				return configError(fmt.Sprintf("headers[%d] missing required 'value' field", i))
+			}
+			value, ok := valueRaw.(string)
+			if !ok {
+				return configError(fmt.Sprintf("headers[%d].value must be a string", i))
+			}
+			if len(value) > headerValueMaxLen {
+				return configError(fmt.Sprintf("headers[%d].value must not exceed %d characters", i, headerValueMaxLen))
+			}
+
+			headers[name] = value
+		}
+	}
+
+	return policy.ImmediateResponse{
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       body,
+	}
+}
+
 // OnRequest returns an immediate response to the client
 func (p *RespondPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
 	// Extract statusCode (default to 200 OK)

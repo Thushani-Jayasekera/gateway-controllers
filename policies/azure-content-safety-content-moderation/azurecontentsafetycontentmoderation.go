@@ -265,8 +265,13 @@ func (p *AzureContentSafetyContentModerationPolicy) Mode() policy.ProcessingMode
 	}
 }
 
-// OnRequest validates request body content
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *AzureContentSafetyContentModerationPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody validates request body content.
+func (p *AzureContentSafetyContentModerationPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !p.hasRequestParams {
 		return policy.UpstreamRequestModifications{}
 	}
@@ -279,7 +284,13 @@ func (p *AzureContentSafetyContentModerationPolicy) OnRequest(ctx *policy.Reques
 }
 
 // OnResponse validates response body content
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *AzureContentSafetyContentModerationPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody validates response body content.
+func (p *AzureContentSafetyContentModerationPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !p.hasResponseParams {
 		return policy.UpstreamResponseModifications{}
 	}

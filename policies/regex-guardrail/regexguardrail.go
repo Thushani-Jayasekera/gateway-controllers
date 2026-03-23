@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	utils "github.com/wso2/api-platform/sdk/utils"
@@ -33,6 +34,10 @@ const (
 	DefaultResponseJSONPath      = "$.choices[0].message.content"
 	RequestFlowEnabledByDefault  = true
 	ResponseFlowEnabledByDefault = false
+
+	sseDataPrefix                    = "data: "
+	sseDone                          = "[DONE]"
+	metaKeyAccumulatedResponseContent = "regexguardrail:accumulated_response_content"
 )
 
 // RegexGuardrailPolicy implements regex-based content validation
@@ -169,8 +174,13 @@ func (p *RegexGuardrailPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest validates request body against regex pattern
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *RegexGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody validates request body against regex pattern.
+func (p *RegexGuardrailPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !p.hasRequestParams || !p.requestParams.Enabled {
 		return policy.UpstreamRequestModifications{}
 	}
@@ -182,8 +192,13 @@ func (p *RegexGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params map[
 	return p.validatePayload(content, p.requestParams, false).(policy.RequestAction)
 }
 
-// OnResponse validates response body against regex pattern
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *RegexGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody validates response body against regex pattern.
+func (p *RegexGuardrailPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
 		return policy.UpstreamResponseModifications{}
 	}
@@ -272,6 +287,151 @@ func (p *RegexGuardrailPolicy) buildErrorResponse(reason string, validationError
 		},
 		Body: bodyBytes,
 	}
+}
+
+// ─── Streaming (SSE) support ──────────────────────────────────────────────────
+//
+// NeedsMoreResponseData and OnResponseBodyChunk together implement
+// StreamingResponsePolicy for SSE (stream: true) responses.
+//
+// Cross-chunk matching: regex patterns can span token boundaries
+// (e.g. "forbidden phrase" split across two SSE events). The accumulated
+// delta.content is stored in ctx.Metadata so every chunk sees the full text
+// seen so far, making cross-boundary matches detectable without inter-chunk
+// buffering in NeedsMoreResponseData.
+//
+// Invert semantics in streaming:
+//   - invert=true  (blocklist): violation detected as soon as the pattern
+//     appears anywhere in the accumulated content; the offending chunk is
+//     replaced with an SSE error event.
+//   - invert=false (allowlist): the full response must match the pattern.
+//     We can only confirm this at stream end ([DONE]), so an SSE error event
+//     is injected at the terminal chunk if no match was found. Content
+//     already forwarded to the client cannot be retracted — this is an
+//     inherent limitation of response streaming.
+
+// NeedsMoreResponseData implements StreamingResponsePolicy.
+// Returns false for every chunk: cross-chunk accumulation is handled via
+// ctx.Metadata rather than kernel-level buffering, keeping each SSE event
+// flowing to the client without delay.
+func (p *RegexGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
+	return false
+}
+
+// OnResponseBodyChunk implements StreamingResponsePolicy.
+// Validates SSE delta.content against the configured regex pattern,
+// accumulating content across chunks so patterns split across token
+// boundaries are still caught.
+func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return policy.ResponseChunkAction{}
+	}
+	if chunk == nil || len(chunk.Chunk) == 0 {
+		return policy.ResponseChunkAction{}
+	}
+
+	chunkStr := string(chunk.Chunk)
+	if !isSSEChunk(chunkStr) {
+		// Non-SSE chunks (e.g. plain JSON via chunked transfer) pass through;
+		// the buffered OnResponseBody handles them when the kernel buffers.
+		return policy.ResponseChunkAction{}
+	}
+
+	rp := p.responseParams
+
+	// Accumulate delta.content from this chunk into the running total.
+	prev := ""
+	if v, ok := ctx.Metadata[metaKeyAccumulatedResponseContent]; ok {
+		if s, ok := v.(string); ok {
+			prev = s
+		}
+	}
+	chunkContent := extractSSEDeltaContent(chunkStr)
+	accumulated := prev + chunkContent
+	ctx.Metadata[metaKeyAccumulatedResponseContent] = accumulated
+
+	compiledRegex, err := regexp.Compile(rp.Regex)
+	if err != nil {
+		// Invalid regex — pass through; the buffered path already caught this.
+		return policy.ResponseChunkAction{}
+	}
+
+	matched := compiledRegex.MatchString(accumulated)
+	isDone := strings.Contains(chunkStr, sseDataPrefix+sseDone)
+
+	var violated bool
+	if rp.Invert {
+		// Blocklist: fail as soon as the prohibited pattern appears.
+		violated = matched
+	} else {
+		// Allowlist: the content must match by the time the stream ends.
+		// Intermediate chunks cannot be validated (match may come later).
+		if isDone && accumulated != "" {
+			violated = !matched
+		}
+	}
+
+	if violated {
+		slog.Debug("RegexGuardrail: streaming validation failed",
+			"regex", rp.Regex, "invert", rp.Invert, "chunkIndex", chunk.Index)
+		return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(rp)}
+	}
+
+	return policy.ResponseChunkAction{}
+}
+
+// isSSEChunk reports whether s contains at least one "data: " SSE line.
+func isSSEChunk(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractSSEDeltaContent concatenates choices[*].delta.content values from
+// every complete SSE data line in s. Returns "" for non-SSE or empty content.
+func extractSSEDeltaContent(s string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			continue
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue // partial or malformed line — skip
+		}
+		choices, _ := data["choices"].([]interface{})
+		for _, cr := range choices {
+			choice, _ := cr.(map[string]interface{})
+			delta, _ := choice["delta"].(map[string]interface{})
+			content, _ := delta["content"].(string)
+			sb.WriteString(content)
+		}
+	}
+	return sb.String()
+}
+
+// buildSSEErrorEvent formats a guardrail intervention as a single SSE data
+// event, replacing the offending chunk in the stream. ImmediateResponse is
+// not available once response headers are committed.
+func (p *RegexGuardrailPolicy) buildSSEErrorEvent(rp RegexGuardrailPolicyParams) []byte {
+	assessment := p.buildAssessmentObject("Violated regular expression: "+rp.Regex, nil, true, rp.ShowAssessment)
+	responseBody := map[string]interface{}{
+		"type":    "REGEX_GUARDRAIL",
+		"message": assessment,
+	}
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(`{"type":"REGEX_GUARDRAIL","message":"Internal error"}`)
+	}
+	return []byte(sseDataPrefix + string(bodyBytes) + "\n\n")
 }
 
 // buildAssessmentObject builds the assessment object

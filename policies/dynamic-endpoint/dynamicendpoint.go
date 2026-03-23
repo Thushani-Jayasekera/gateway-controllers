@@ -37,7 +37,23 @@ func (p *DynamicEndpointPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest sets the dynamic upstream for routing.
+// OnRequestHeaders routes the request to the configured upstream.
+func (p *DynamicEndpointPolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	slog.Info("[Dynamic Endpoint]: OnRequestHeaders called", "targetUpstream", p.targetUpstream)
+
+	if p.targetUpstream == "" {
+		slog.Warn("[Dynamic Endpoint]: No target upstream configured, passing through")
+		return policy.UpstreamRequestHeaderModifications{}
+	}
+
+	// Use UpstreamName to route the request to the target upstream definition.
+	// The upstream name must match an entry in the API's upstreamDefinitions.
+	return policy.UpstreamRequestHeaderModifications{
+		UpstreamName: &p.targetUpstream,
+	}
+}
+
+// OnRequest applies upstream routing for v1alpha engine compatibility.
 func (p *DynamicEndpointPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
 	slog.Info("[Dynamic Endpoint]: OnRequest called", "targetUpstream", p.targetUpstream)
 
@@ -46,8 +62,8 @@ func (p *DynamicEndpointPolicy) OnRequest(ctx *policy.RequestContext, params map
 		return policy.UpstreamRequestModifications{}
 	}
 
-	// Use UpstreamName to route the request to the target upstream definition
-	// The upstream name must match an entry in the API's upstreamDefinitions
+	// Use UpstreamName to route the request to the target upstream definition.
+	// The upstream name must match an entry in the API's upstreamDefinitions.
 	return policy.UpstreamRequestModifications{
 		UpstreamName: &p.targetUpstream,
 	}

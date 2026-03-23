@@ -34,9 +34,10 @@ import (
 
 const (
 	// Metadata keys for context storage
-	MetadataKeySelectedModel = "model_roundrobin.selected_model"
-	MetadataKeyOriginalModel = "model_roundrobin.original_model"
-	DefaultSuspendDuration   = 30
+	MetadataKeySelectedModel   = "model_roundrobin.selected_model"
+	MetadataKeyOriginalModel   = "model_roundrobin.original_model"
+	MetadataKeyHeadersProcessed = "model_roundrobin.headers_processed"
+	DefaultSuspendDuration     = 30
 )
 
 // ModelRoundRobinPolicyParams holds the parsed policy parameters
@@ -227,8 +228,105 @@ func (p *ModelRoundRobinPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest processes the request and selects the next model in round-robin order
+// OnRequestHeaders selects the next model and applies the modification for header/queryParam/pathParam
+// locations in the request header phase. For payload location, the model is pre-selected and
+// stored in metadata for OnRequest to apply to the body.
+func (p *ModelRoundRobinPolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	location := p.params.RequestModel.Location
+	identifier := p.params.RequestModel.Identifier
+
+	// Select next available model in round-robin fashion
+	selectedModel := p.selectNextAvailableModel(p.params.Models)
+	if selectedModel == nil {
+		return policy.ImmediateResponse{
+			StatusCode: 503,
+			Headers:    map[string]string{"Content-Type": "application/json"},
+			Body:       []byte(`{"error": "All models are currently unavailable"}`),
+		}
+	}
+
+	ctx.Metadata[MetadataKeySelectedModel] = selectedModel.Model
+	ctx.Metadata[MetadataKeyHeadersProcessed] = true
+	slog.Debug("ModelRoundRobin: OnRequestHeaders selected model", "model", selectedModel.Model)
+
+	switch location {
+	case "header":
+		if ctx.Headers != nil {
+			values := ctx.Headers.Get(identifier)
+			if len(values) > 0 && values[0] != "" {
+				ctx.Metadata[MetadataKeyOriginalModel] = values[0]
+			}
+		}
+		return policy.UpstreamRequestHeaderModifications{
+			Set: map[string]string{identifier: selectedModel.Model},
+		}
+	case "queryParam":
+		newPath := p.modifyQueryParamInPath(ctx.Path, identifier, selectedModel.Model)
+		if newPath != ctx.Path {
+			return policy.UpstreamRequestHeaderModifications{
+				Set: map[string]string{":path": newPath},
+			}
+		}
+		return policy.UpstreamRequestHeaderModifications{}
+	case "pathParam":
+		newPath := p.modifyPathParamInPath(ctx.Path, identifier, selectedModel.Model)
+		if newPath != ctx.Path {
+			return policy.UpstreamRequestHeaderModifications{
+				Set: map[string]string{":path": newPath},
+			}
+		}
+		return policy.UpstreamRequestHeaderModifications{}
+	default: // payload — body not available in header phase; OnRequest will handle it
+		return policy.UpstreamRequestHeaderModifications{}
+	}
+}
+
+// OnResponseHeaders suspends a model in the response header phase when an error is detected.
+func (p *ModelRoundRobinPolicy) OnResponseHeaders(ctx *policy.ResponseHeaderContext, params map[string]interface{}) policy.ResponseHeaderAction {
+	if ctx.ResponseStatus >= 500 || ctx.ResponseStatus == 429 {
+		selectedModel := ""
+		if model, ok := ctx.Metadata[MetadataKeySelectedModel]; ok {
+			if modelStr, ok := model.(string); ok {
+				selectedModel = modelStr
+			}
+		}
+		if p.params.SuspendDuration > 0 && selectedModel != "" {
+			p.mu.Lock()
+			p.suspendedModels[selectedModel] = time.Now().Add(time.Duration(p.params.SuspendDuration) * time.Second)
+			p.mu.Unlock()
+			slog.Debug("ModelRoundRobin: OnResponseHeaders suspended model", "model", selectedModel, "duration", p.params.SuspendDuration)
+		}
+	}
+	return policy.DownstreamResponseHeaderModifications{}
+}
+
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *ModelRoundRobinPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody processes the request and selects the next model in round-robin order.
+func (p *ModelRoundRobinPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
+	// If OnRequestHeaders already ran, use the pre-selected model rather than re-selecting
+	if _, done := ctx.Metadata[MetadataKeyHeadersProcessed]; done {
+		if p.params.RequestModel.Location == "payload" {
+			selectedModel, _ := ctx.Metadata[MetadataKeySelectedModel].(string)
+			if selectedModel == "" {
+				return policy.UpstreamRequestModifications{}
+			}
+			originalModel, err := p.extractModelFromRequest(ctx)
+			if err != nil {
+				slog.Debug("ModelRoundRobin: Could not extract original model from body", "error", err)
+			}
+			if originalModel != "" {
+				ctx.Metadata[MetadataKeyOriginalModel] = originalModel
+			}
+			return p.modifyRequestModel(ctx, selectedModel)
+		}
+		// Non-payload locations were already handled in OnRequestHeaders
+		return policy.UpstreamRequestModifications{}
+	}
+
 	// Extract original model from request
 	originalModel, err := p.extractModelFromRequest(ctx)
 	if err != nil {
@@ -420,6 +518,60 @@ func (p *ModelRoundRobinPolicy) extractModelFromPath(ctx *policy.RequestContext,
 	}
 
 	return "", fmt.Errorf("regex pattern %s matched but no capture group found", regexPattern)
+}
+
+// modifyQueryParamInPath updates a query parameter value in a raw path string.
+func (p *ModelRoundRobinPolicy) modifyQueryParamInPath(rawPath, paramName, newModel string) string {
+	if rawPath == "" {
+		return rawPath
+	}
+	decodedPath, err := url.PathUnescape(rawPath)
+	if err != nil {
+		return rawPath
+	}
+	parts := strings.Split(decodedPath, "?")
+	pathBase := parts[0]
+	var queryValues url.Values
+	if len(parts) == 2 {
+		queryValues, err = url.ParseQuery(parts[1])
+		if err != nil {
+			return rawPath
+		}
+	} else {
+		queryValues = make(url.Values)
+	}
+	queryValues.Set(paramName, newModel)
+	return pathBase + "?" + queryValues.Encode()
+}
+
+// modifyPathParamInPath replaces a regex capture group in a raw path string.
+func (p *ModelRoundRobinPolicy) modifyPathParamInPath(rawPath, regexPattern, newModel string) string {
+	if rawPath == "" {
+		return rawPath
+	}
+	decodedPath, err := url.PathUnescape(rawPath)
+	if err != nil {
+		return rawPath
+	}
+	parts := strings.Split(decodedPath, "?")
+	pathWithoutQuery := parts[0]
+	queryString := ""
+	if len(parts) == 2 {
+		queryString = parts[1]
+	}
+	re, err := regexp.Compile(regexPattern)
+	if err != nil {
+		return rawPath
+	}
+	matchIndices := re.FindStringSubmatchIndex(pathWithoutQuery)
+	if len(matchIndices) < 4 || matchIndices[2] == -1 || matchIndices[3] == -1 {
+		return rawPath
+	}
+	updatedPath := pathWithoutQuery[:matchIndices[2]] + newModel + pathWithoutQuery[matchIndices[3]:]
+	if queryString != "" {
+		return updatedPath + "?" + queryString
+	}
+	return updatedPath
 }
 
 // modifyRequestModel modifies the request to replace the model field based on location

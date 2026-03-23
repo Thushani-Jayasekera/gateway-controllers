@@ -249,7 +249,13 @@ func (p *McpRewritePolicy) Mode() policy.ProcessingMode {
 	}
 }
 
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *McpRewritePolicy) OnRequest(ctx *policy.RequestContext, params map[string]any) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody applies rewrite rules to the MCP request body.
+func (p *McpRewritePolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !isMcpPostRequest(ctx.Method, ctx.Path) {
 		return nil
 	}
@@ -336,7 +342,13 @@ func (p *McpRewritePolicy) OnRequest(ctx *policy.RequestContext, params map[stri
 	return nil
 }
 
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *McpRewritePolicy) OnResponse(ctx *policy.ResponseContext, params map[string]any) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody rewrites MCP capability list response items according to configured entries.
+func (p *McpRewritePolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !isMcpPostRequest(ctx.RequestMethod, ctx.RequestPath) {
 		return nil
 	}

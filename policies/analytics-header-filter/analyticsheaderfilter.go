@@ -122,6 +122,52 @@ func (p *AnalyticsHeaderFilterPolicy) parseHeaderFilterConfig(configRaw interfac
 	return mode, headers, nil
 }
 
+// OnRequestHeaders processes request headers for analytics filtering in the header phase.
+func (p *AnalyticsHeaderFilterPolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	requestConfigRaw, hasRequestConfig := params["request"]
+	if !hasRequestConfig || requestConfigRaw == nil {
+		return policy.UpstreamRequestHeaderModifications{}
+	}
+
+	mode, specifiedHeaders, err := p.parseHeaderFilterConfig(requestConfigRaw)
+	if err != nil {
+		slog.Warn("Analytics Header Filter Policy: Failed to parse request headers filter config", "error", err)
+		return policy.UpstreamRequestHeaderModifications{}
+	}
+
+	slog.Debug("Analytics Header Filter Policy: Parsed request config",
+	"mode", mode,
+	"headers", specifiedHeaders)
+
+	return policy.UpstreamRequestHeaderModifications{
+		AnalyticsHeaderFilter: policy.DropHeaderAction{
+			Action:  mode,
+			Headers: specifiedHeaders,
+		},
+	}
+}
+
+// OnResponseHeaders processes response headers for analytics filtering in the header phase.
+func (p *AnalyticsHeaderFilterPolicy) OnResponseHeaders(ctx *policy.ResponseHeaderContext, params map[string]interface{}) policy.ResponseHeaderAction {
+	responseConfigRaw, hasResponseConfig := params["response"]
+	if !hasResponseConfig || responseConfigRaw == nil {
+		return policy.DownstreamResponseHeaderModifications{}
+	}
+
+	mode, specifiedHeaders, err := p.parseHeaderFilterConfig(responseConfigRaw)
+	if err != nil {
+		slog.Warn("Analytics Header Filter Policy: Failed to parse response headers filter config", "error", err)
+		return policy.DownstreamResponseHeaderModifications{}
+	}
+
+	return policy.DownstreamResponseHeaderModifications{
+		AnalyticsHeaderFilter: policy.DropHeaderAction{
+			Action:  mode,
+			Headers: specifiedHeaders,
+		},
+	}
+}
+
 // OnRequest processes request headers and marks them for exclusion from analytics
 func (p *AnalyticsHeaderFilterPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
 	requestConfigRaw, hasRequestConfig := params["request"]

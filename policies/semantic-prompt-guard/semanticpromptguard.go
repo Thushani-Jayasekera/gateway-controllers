@@ -324,8 +324,13 @@ func (p *SemanticPromptGuardPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest performs semantic filtering of the incoming prompt
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *SemanticPromptGuardPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody performs semantic filtering of the incoming prompt.
+func (p *SemanticPromptGuardPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	var content []byte
 	if ctx.Body != nil {
 		content = ctx.Body.Content

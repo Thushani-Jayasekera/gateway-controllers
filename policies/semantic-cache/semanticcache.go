@@ -307,8 +307,13 @@ func (p *SemanticCachePolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest handles request body processing for semantic caching
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *SemanticCachePolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody handles request body processing for semantic caching.
+func (p *SemanticCachePolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	var content []byte
 	if ctx.Body != nil {
 		content = ctx.Body.Content
@@ -390,8 +395,13 @@ func (p *SemanticCachePolicy) OnRequest(ctx *policy.RequestContext, params map[s
 	}
 }
 
-// OnResponse handles response body processing for semantic caching
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *SemanticCachePolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody handles response body processing for semantic caching.
+func (p *SemanticCachePolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	// Only cache successful responses (200 status code)
 	if ctx.ResponseStatus != 200 {
 		slog.Debug("SemanticCache: Skipping cache for non-200 response", "statusCode", ctx.ResponseStatus)

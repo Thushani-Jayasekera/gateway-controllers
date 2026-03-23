@@ -36,6 +36,10 @@ const (
 	DefaultResponseJSONPath      = "$.choices[0].message.content"
 	RequestFlowEnabledByDefault  = true
 	ResponseFlowEnabledByDefault = false
+
+	sseDataPrefix              = "data: "
+	sseDone                    = "[DONE]"
+	metaKeyResponseRunningBytes = "contentlengthguardrail:response_bytes"
 )
 
 var textCleanRegexCompiled = regexp.MustCompile(TextCleanRegex)
@@ -219,8 +223,13 @@ func (p *ContentLengthGuardrailPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest validates request body content length
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *ContentLengthGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody validates request body content length.
+func (p *ContentLengthGuardrailPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !p.hasRequestParams || !p.requestParams.Enabled {
 		return policy.UpstreamRequestModifications{}
 	}
@@ -233,7 +242,13 @@ func (p *ContentLengthGuardrailPolicy) OnRequest(ctx *policy.RequestContext, par
 }
 
 // OnResponse validates response body content length
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *ContentLengthGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody validates response body content length.
+func (p *ContentLengthGuardrailPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
 		return policy.UpstreamResponseModifications{}
 	}
@@ -287,6 +302,168 @@ func (p *ContentLengthGuardrailPolicy) validatePayload(payload []byte, params Co
 		return policy.UpstreamResponseModifications{}
 	}
 	return policy.UpstreamRequestModifications{}
+}
+
+// ─── Streaming (SSE) support ──────────────────────────────────────────────────
+//
+// NeedsMoreResponseData and OnResponseBodyChunk together implement
+// StreamingResponsePolicy for SSE (stream: true) responses.
+//
+// max enforcement (early termination):
+//   When only max is configured (no min, no invert), NeedsMoreResponseData
+//   returns false so each SSE event is forwarded immediately. OnResponseBodyChunk
+//   maintains a running byte count in ctx.Metadata and injects an SSE error
+//   event as soon as the cumulative delta.content byte length exceeds max.
+//   This terminates the content guardrail at the earliest possible point.
+//
+// min enforcement (full-stream buffering):
+//   When min is configured (or invert=true), the complete stream must be seen
+//   before a pass/fail decision is possible. NeedsMoreResponseData returns true
+//   until [DONE] arrives, causing the kernel to accumulate all chunks. The full
+//   accumulated content is then validated in a single OnResponseBodyChunk call.
+//   Note: with min configured the client receives content only after [DONE], so
+//   the behaviour is equivalent to the buffered OnResponseBody path; the benefit
+//   is that the same chain can early-terminate on a max violation when a
+//   subsequent request uses a max-only configuration.
+
+// NeedsMoreResponseData implements StreamingResponsePolicy.
+// Returns true (buffer everything) when min is configured or invert is set,
+// because those checks require the full response length. Returns false for
+// max-only configurations so chunks flow immediately and can be early-terminated.
+func (p *ContentLengthGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return false
+	}
+	s := string(accumulated)
+	// Non-SSE: don't buffer — the buffered OnResponseBody handles it.
+	if !isSSEChunk(s) {
+		return false
+	}
+	// Stream is complete — flush regardless of configuration.
+	if strings.Contains(s, sseDataPrefix+sseDone) {
+		return false
+	}
+	// Buffer until [DONE] when min or invert requires the full content.
+	rp := p.responseParams
+	return rp.Min > 0 || rp.Invert
+}
+
+// OnResponseBodyChunk implements StreamingResponsePolicy.
+// Maintains a running delta.content byte count across chunks and validates
+// the content length against the configured min/max thresholds.
+func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return policy.ResponseChunkAction{}
+	}
+	if chunk == nil || len(chunk.Chunk) == 0 {
+		return policy.ResponseChunkAction{}
+	}
+
+	chunkStr := string(chunk.Chunk)
+	if !isSSEChunk(chunkStr) {
+		return policy.ResponseChunkAction{}
+	}
+
+	rp := p.responseParams
+
+	// Add this chunk's delta.content bytes to the running total stored in metadata.
+	// Metadata persists across OnResponseBodyChunk invocations for the same request.
+	prev := 0
+	if v, ok := ctx.Metadata[metaKeyResponseRunningBytes]; ok {
+		if n, ok := v.(int); ok {
+			prev = n
+		}
+	}
+	chunkContent := extractSSEDeltaContent(chunkStr)
+	running := prev + len([]byte(chunkContent))
+	ctx.Metadata[metaKeyResponseRunningBytes] = running
+
+	isDone := strings.Contains(chunkStr, sseDataPrefix+sseDone)
+
+	// Early termination on max violation (max-only path, no buffering).
+	// Invert mode is excluded here because it needs the full length to decide.
+	if rp.Max > 0 && !rp.Invert && running > rp.Max {
+		reason := fmt.Sprintf("content length %d bytes is outside the allowed range %d-%d bytes", running, rp.Min, rp.Max)
+		slog.Debug("ContentLengthGuardrail: streaming max violation",
+			"runningBytes", running, "max", rp.Max)
+		return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max)}
+	}
+
+	// At end of stream: perform the complete min/max/invert validation.
+	if isDone {
+		inRange := running >= rp.Min && (rp.Max == 0 || running <= rp.Max)
+		passed := inRange
+		if rp.Invert {
+			passed = !inRange
+		}
+		if !passed {
+			var reason string
+			if rp.Invert {
+				reason = fmt.Sprintf("content length %d bytes is within the excluded range %d-%d bytes", running, rp.Min, rp.Max)
+			} else {
+				reason = fmt.Sprintf("content length %d bytes is outside the allowed range %d-%d bytes", running, rp.Min, rp.Max)
+			}
+			slog.Debug("ContentLengthGuardrail: streaming validation failed",
+				"runningBytes", running, "min", rp.Min, "max", rp.Max, "invert", rp.Invert)
+			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max)}
+		}
+	}
+
+	return policy.ResponseChunkAction{}
+}
+
+// isSSEChunk reports whether s contains at least one "data: " SSE line.
+func isSSEChunk(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractSSEDeltaContent concatenates choices[*].delta.content values from
+// every complete SSE data line in s. Returns "" for non-SSE or empty content.
+func extractSSEDeltaContent(s string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			continue
+		}
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
+			continue // partial or malformed line — skip
+		}
+		choices, _ := data["choices"].([]interface{})
+		for _, cr := range choices {
+			choice, _ := cr.(map[string]interface{})
+			delta, _ := choice["delta"].(map[string]interface{})
+			content, _ := delta["content"].(string)
+			sb.WriteString(content)
+		}
+	}
+	return sb.String()
+}
+
+// buildSSEErrorEvent formats a guardrail violation as a single SSE data event
+// that replaces the offending chunk. ImmediateResponse is unavailable once
+// response headers are committed to the downstream client.
+func (p *ContentLengthGuardrailPolicy) buildSSEErrorEvent(reason string, showAssessment bool, min, max int) []byte {
+	assessment := p.buildAssessmentObject(reason, nil, true, showAssessment, min, max)
+	responseBody := map[string]interface{}{
+		"type":    "CONTENT_LENGTH_GUARDRAIL",
+		"message": assessment,
+	}
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(`{"type":"CONTENT_LENGTH_GUARDRAIL","message":"Internal error"}`)
+	}
+	return []byte(sseDataPrefix + string(bodyBytes) + "\n\n")
 }
 
 // buildErrorResponse builds an error response for both request and response phases

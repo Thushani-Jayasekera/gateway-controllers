@@ -126,18 +126,72 @@ func (p *BasicRateLimitPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest delegates to the core ratelimit policy's OnRequest method.
+// OnRequestHeaders delegates to the core ratelimit policy's OnRequestHeaders method if available.
+func (p *BasicRateLimitPolicy) OnRequestHeaders(
+	ctx *policy.RequestHeaderContext,
+	params map[string]interface{},
+) policy.RequestHeaderAction {
+	type requestHeaderPolicer interface {
+		OnRequestHeaders(*policy.RequestHeaderContext, map[string]interface{}) policy.RequestHeaderAction
+	}
+	if rl, ok := p.delegate.(requestHeaderPolicer); ok {
+		return rl.OnRequestHeaders(ctx, params)
+	}
+	return policy.UpstreamRequestHeaderModifications{}
+}
+
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *BasicRateLimitPolicy) OnRequest(
 	ctx *policy.RequestContext,
 	params map[string]interface{},
 ) policy.RequestAction {
-	return p.delegate.OnRequest(ctx, params)
+	return p.OnRequestBody(ctx)
 }
 
-// OnResponse delegates to the core ratelimit policy's OnResponse method.
+// OnRequestBody delegates to the core ratelimit policy's OnRequestBody method if available.
+func (p *BasicRateLimitPolicy) OnRequestBody(
+	ctx *policy.RequestContext,
+) policy.RequestAction {
+	type requestBodyPolicer interface {
+		OnRequestBody(*policy.RequestContext) policy.RequestAction
+	}
+	if rl, ok := p.delegate.(requestBodyPolicer); ok {
+		return rl.OnRequestBody(ctx)
+	}
+	return p.delegate.OnRequest(ctx, nil)
+}
+
+// OnResponseHeaders delegates to the core ratelimit policy's OnResponseHeaders method if available.
+func (p *BasicRateLimitPolicy) OnResponseHeaders(
+	ctx *policy.ResponseHeaderContext,
+	params map[string]interface{},
+) policy.ResponseHeaderAction {
+	type responseHeaderPolicer interface {
+		OnResponseHeaders(*policy.ResponseHeaderContext, map[string]interface{}) policy.ResponseHeaderAction
+	}
+	if rl, ok := p.delegate.(responseHeaderPolicer); ok {
+		return rl.OnResponseHeaders(ctx, params)
+	}
+	return policy.DownstreamResponseHeaderModifications{}
+}
+
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *BasicRateLimitPolicy) OnResponse(
 	ctx *policy.ResponseContext,
 	params map[string]interface{},
 ) policy.ResponseAction {
-	return p.delegate.OnResponse(ctx, params)
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody delegates to the core ratelimit policy's OnResponseBody method if available.
+func (p *BasicRateLimitPolicy) OnResponseBody(
+	ctx *policy.ResponseContext,
+) policy.ResponseAction {
+	type responseBodyPolicer interface {
+		OnResponseBody(*policy.ResponseContext) policy.ResponseAction
+	}
+	if rl, ok := p.delegate.(responseBodyPolicer); ok {
+		return rl.OnResponseBody(ctx)
+	}
+	return p.delegate.OnResponse(ctx, nil)
 }

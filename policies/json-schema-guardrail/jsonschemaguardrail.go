@@ -167,8 +167,13 @@ func (p *JSONSchemaGuardrailPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest validates request body against JSON schema
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *JSONSchemaGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody validates request body against JSON schema.
+func (p *JSONSchemaGuardrailPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !p.hasRequestParams || !p.requestParams.Enabled {
 		return policy.UpstreamRequestModifications{}
 	}
@@ -180,8 +185,13 @@ func (p *JSONSchemaGuardrailPolicy) OnRequest(ctx *policy.RequestContext, params
 	return p.validatePayload(content, p.requestParams, false).(policy.RequestAction)
 }
 
-// OnResponse validates response body against JSON schema
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *JSONSchemaGuardrailPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody validates response body against JSON schema.
+func (p *JSONSchemaGuardrailPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
 		return policy.UpstreamResponseModifications{}
 	}

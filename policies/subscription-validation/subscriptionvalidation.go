@@ -167,6 +167,66 @@ func (p *SubscriptionValidationPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
+// OnRequestHeaders validates the subscription in the request header phase.
+func (p *SubscriptionValidationPolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	if !p.cfg.Enabled {
+		return policy.UpstreamRequestHeaderModifications{}
+	}
+	if ctx == nil || ctx.SharedContext == nil {
+		return p.forbiddenResponse("request context is missing").(policy.ImmediateResponse)
+	}
+
+	apiID := ctx.SharedContext.APIId
+	if strings.TrimSpace(apiID) == "" {
+		slog.Error("subscriptionValidation: APIId is empty in SharedContext; failing validation")
+		return p.forbiddenResponse("API id is missing").(policy.ImmediateResponse)
+	}
+
+	if p.store == nil {
+		slog.Error("subscriptionValidation: subscription store is not initialized")
+		return p.forbiddenResponse("subscription store is not available").(policy.ImmediateResponse)
+	}
+
+	if ctx.Headers != nil {
+		headerValues := ctx.Headers.Get(p.cfg.SubscriptionKeyHeader)
+		if len(headerValues) > 0 {
+			token := strings.TrimSpace(headerValues[0])
+			if token != "" {
+				result := p.validateByToken(apiID, token)
+				if result == nil {
+					return policy.UpstreamRequestHeaderModifications{}
+				}
+				return result.(policy.ImmediateResponse)
+			}
+		}
+		if p.cfg.SubscriptionKeyCookie != "" {
+			if token := getCookieValue(ctx.Headers, p.cfg.SubscriptionKeyCookie); token != "" {
+				result := p.validateByToken(apiID, token)
+				if result == nil {
+					return policy.UpstreamRequestHeaderModifications{}
+				}
+				return result.(policy.ImmediateResponse)
+			}
+		}
+	}
+
+	metadata := ctx.SharedContext.Metadata
+	if metadata != nil {
+		if rawAppID, ok := metadata[applicationIDMetadataKey]; ok {
+			appID := strings.TrimSpace(fmt.Sprint(rawAppID))
+			if appID != "" {
+				result := p.validateByApplication(apiID, appID)
+				if result == nil {
+					return policy.UpstreamRequestHeaderModifications{}
+				}
+				return result.(policy.ImmediateResponse)
+			}
+		}
+	}
+
+	return p.forbiddenResponse("no subscription token or application identity provided").(policy.ImmediateResponse)
+}
+
 // OnRequest validates the subscription (token-first, appId-fallback)
 // and enforces plan-based rate limiting when applicable.
 func (p *SubscriptionValidationPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {

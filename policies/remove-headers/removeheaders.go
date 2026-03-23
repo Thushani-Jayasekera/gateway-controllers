@@ -198,6 +198,36 @@ func (p *RemoveHeadersPolicy) OnRequest(ctx *policy.RequestContext, params map[s
 	}
 }
 
+// OnRequestHeaders removes headers from the request in the header phase.
+func (p *RemoveHeadersPolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	requestHeadersRaw, ok, err := p.getPhaseHeaders(params, "request", "requestHeaders")
+	if err != nil || !ok {
+		return policy.UpstreamRequestHeaderModifications{}
+	}
+	headerNames := p.parseHeaderNames(requestHeadersRaw)
+	if len(headerNames) == 0 {
+		return policy.UpstreamRequestHeaderModifications{}
+	}
+	return policy.UpstreamRequestHeaderModifications{
+		Remove: headerNames,
+	}
+}
+
+// OnResponseHeaders removes headers from the response in the header phase.
+func (p *RemoveHeadersPolicy) OnResponseHeaders(ctx *policy.ResponseHeaderContext, params map[string]interface{}) policy.ResponseHeaderAction {
+	responseHeadersRaw, ok, err := p.getPhaseHeaders(params, "response", "responseHeaders")
+	if err != nil || !ok {
+		return policy.DownstreamResponseHeaderModifications{}
+	}
+	headerNames := p.parseHeaderNames(responseHeadersRaw)
+	if len(headerNames) == 0 {
+		return policy.DownstreamResponseHeaderModifications{}
+	}
+	return policy.DownstreamResponseHeaderModifications{
+		Remove: headerNames,
+	}
+}
+
 // OnResponse removes headers from the response
 // Uses RemoveHeaders to remove specified headers from responses
 func (p *RemoveHeadersPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {

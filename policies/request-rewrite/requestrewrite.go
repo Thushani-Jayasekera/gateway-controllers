@@ -118,26 +118,69 @@ type queryRule struct {
 	Substitution string `json:"substitution"`
 }
 
-// OnRequest applies request transformations based on policy configuration
+// OnRequestHeaders applies request transformations in the header phase for v2alpha engine compatibility.
+func (p *RequestRewritePolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	newPath, newMethod, err := p.computeRewrite(ctx.Headers, ctx.Path, ctx.OperationPath, ctx.APIContext, params)
+	if err != nil {
+		slog.Error("[Request Rewrite]: Configuration error", "error", err)
+		body, _ := json.Marshal(map[string]string{
+			"error":   "Configuration Error",
+			"message": err.Error(),
+		})
+		return policy.ImmediateResponse{
+			StatusCode: 500,
+			Headers:    map[string]string{"content-type": "application/json"},
+			Body:       body,
+		}
+	}
+	return policy.UpstreamRequestHeaderModifications{
+		Path:   newPath,
+		Method: newMethod,
+	}
+}
+
+// OnRequest applies request transformations for v1alpha engine compatibility.
 func (p *RequestRewritePolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
-	cfg, err := parseConfig(params)
+	newPath, newMethod, err := p.computeRewrite(ctx.Headers, ctx.Path, ctx.OperationPath, ctx.APIContext, params)
 	if err != nil {
 		return configErrorResponse("Invalid request-rewrite configuration", err)
+	}
+	mods := policy.UpstreamRequestModifications{}
+	if newPath != nil {
+		mods.Path = newPath
+	}
+	if newMethod != nil {
+		mods.Method = newMethod
+	}
+	return mods
+}
+
+// OnResponse is not used for this policy.
+func (p *RequestRewritePolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
+	return nil
+}
+
+// computeRewrite parses config and computes path/method rewrites from the provided request fields.
+// Called from both OnRequestHeaders and OnRequestBody to share logic without duplication.
+func (p *RequestRewritePolicy) computeRewrite(headers *policy.Headers, path string, operationPath string, apiContext string, params map[string]interface{}) (newPath *string, newMethod *string, err error) {
+	cfg, parseErr := parseConfig(params)
+	if parseErr != nil {
+		return nil, nil, parseErr
 	}
 
 	if cfg == nil {
 		slog.Debug("[Request Rewrite]: No configuration provided, passing through")
-		return policy.UpstreamRequestModifications{}
+		return nil, nil, nil
 	}
 
-	if !matchesRequest(ctx, cfg.Match) {
+	if !matchesRequest(headers, path, cfg.Match) {
 		slog.Debug("[Request Rewrite]: Match conditions not met, skipping transformations")
-		return policy.UpstreamRequestModifications{}
+		return nil, nil, nil
 	}
 
-	originalPath := ctx.Path
+	originalPath := path
 	pathOnly, queryValues, _ := splitPathAndQuery(originalPath)
-	basePrefix, relativePath := splitBasePath(ctx, pathOnly)
+	basePrefix, relativePath := splitBasePath(apiContext, pathOnly)
 	updatedRelativePath := relativePath
 	pathRewriteApplied := false
 	queryRewriteConfigured := cfg.QueryRewrite != nil
@@ -146,21 +189,21 @@ func (p *RequestRewritePolicy) OnRequest(ctx *policy.RequestContext, params map[
 	if cfg.PathRewrite != nil {
 		rewriteType := strings.ToUpper(strings.TrimSpace(cfg.PathRewrite.Type))
 		if rewriteType == pathReplaceFull {
-			// ReplaceFullPath replaces the ENTIRE path, not just the relative portion
+			// ReplaceFullPath replaces the ENTIRE path, not just the relative portion.
 			isFullPathReplacement = true
 			if cfg.PathRewrite.ReplaceFullPath != "" {
 				updatedRelativePath = cfg.PathRewrite.ReplaceFullPath
 				pathRewriteApplied = true
 			}
 		} else {
-			updatedRelativePath = applyPathRewrite(ctx, updatedRelativePath, cfg.PathRewrite)
+			updatedRelativePath = applyPathRewrite(operationPath, updatedRelativePath, cfg.PathRewrite)
 			pathRewriteApplied = updatedRelativePath != relativePath
 		}
 	}
 
 	if cfg.QueryRewrite != nil {
-		if err := applyQueryRewrite(queryValues, cfg.QueryRewrite); err != nil {
-			return configErrorResponse("Invalid queryRewrite configuration", err)
+		if qErr := applyQueryRewrite(queryValues, cfg.QueryRewrite); qErr != nil {
+			return nil, nil, fmt.Errorf("invalid queryRewrite configuration: %w", qErr)
 		}
 	}
 
@@ -168,7 +211,6 @@ func (p *RequestRewritePolicy) OnRequest(ctx *policy.RequestContext, params map[
 	if pathRewriteApplied || queryRewriteConfigured {
 		var updatedPath string
 		if isFullPathReplacement {
-			// For full path replacement, use the replacement directly without rejoining with base
 			updatedPath = updatedRelativePath
 		} else {
 			updatedPath = joinBaseAndRelative(basePrefix, updatedRelativePath)
@@ -176,29 +218,22 @@ func (p *RequestRewritePolicy) OnRequest(ctx *policy.RequestContext, params map[
 		finalPath = buildPath(updatedPath, queryValues)
 	}
 
-	mods := policy.UpstreamRequestModifications{}
-
 	if finalPath != originalPath {
 		slog.Info("[Request Rewrite]: Scheduling path rewrite", "from", originalPath, "to", finalPath)
-		mods.Path = &finalPath
+		newPath = &finalPath
 	}
 
 	method := strings.TrimSpace(cfg.MethodRewrite)
 	if method != "" {
 		method = strings.ToUpper(method)
 		if !isAllowedMethod(method) {
-			return configErrorResponse("Invalid methodRewrite value", fmt.Errorf("unsupported method: %s", method))
+			return nil, nil, fmt.Errorf("invalid methodRewrite value: unsupported method: %s", method)
 		}
-		mods.Method = &method
 		slog.Info("[Request Rewrite]: Scheduling method rewrite", "method", method)
+		newMethod = &method
 	}
 
-	return mods
-}
-
-// OnResponse is not used for this policy
-func (p *RequestRewritePolicy) OnResponse(ctx *policy.ResponseContext, params map[string]interface{}) policy.ResponseAction {
-	return nil
+	return newPath, newMethod, nil
 }
 
 func parseConfig(params map[string]interface{}) (*policyConfig, error) {
@@ -231,7 +266,7 @@ func configErrorResponse(message string, err error) policy.RequestAction {
 	}
 }
 
-func matchesRequest(ctx *policy.RequestContext, match *matchConfig) bool {
+func matchesRequest(headers *policy.Headers, path string, match *matchConfig) bool {
 	if match == nil {
 		return true
 	}
@@ -241,13 +276,13 @@ func matchesRequest(ctx *policy.RequestContext, match *matchConfig) bool {
 	}
 
 	for _, matcher := range match.Headers {
-		if !matchHeader(ctx, matcher) {
+		if !matchHeader(headers, matcher) {
 			return false
 		}
 	}
 
 	if len(match.QueryParams) > 0 {
-		_, queryValues, _ := splitPathAndQuery(ctx.Path)
+		_, queryValues, _ := splitPathAndQuery(path)
 		for _, matcher := range match.QueryParams {
 			if !matchQueryParam(queryValues, matcher) {
 				return false
@@ -258,14 +293,14 @@ func matchesRequest(ctx *policy.RequestContext, match *matchConfig) bool {
 	return true
 }
 
-func matchHeader(ctx *policy.RequestContext, matcher headerMatcher) bool {
+func matchHeader(headers *policy.Headers, matcher headerMatcher) bool {
 	name := strings.TrimSpace(matcher.Name)
 	if name == "" {
 		return false
 	}
 
 	matchType := strings.ToUpper(strings.TrimSpace(matcher.Type))
-	values := ctx.Headers.Get(name)
+	values := headers.Get(name)
 
 	switch matchType {
 	case matchTypePresent:
@@ -331,12 +366,12 @@ func matchQueryParam(values url.Values, matcher queryParamMatch) bool {
 	}
 }
 
-func applyPathRewrite(ctx *policy.RequestContext, currentPath string, cfg *pathRewrite) string {
+func applyPathRewrite(operationPath string, currentPath string, cfg *pathRewrite) string {
 	rewriteType := strings.ToUpper(strings.TrimSpace(cfg.Type))
 
 	switch rewriteType {
 	case pathReplacePrefix:
-		operationPath := strings.TrimSpace(ctx.OperationPath)
+		operationPath := strings.TrimSpace(operationPath)
 		if operationPath == "" {
 			slog.Warn("[Request Rewrite]: Operation path is empty, skipping prefix rewrite")
 			return currentPath
@@ -371,8 +406,8 @@ func applyPathRewrite(ctx *policy.RequestContext, currentPath string, cfg *pathR
 	}
 }
 
-func splitBasePath(ctx *policy.RequestContext, pathOnly string) (string, string) {
-	base := strings.TrimSpace(ctx.APIContext)
+func splitBasePath(apiContext string, pathOnly string) (string, string) {
+	base := strings.TrimSpace(apiContext)
 	if base == "" || base == "/" {
 		return "", pathOnly
 	}

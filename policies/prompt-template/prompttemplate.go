@@ -219,8 +219,13 @@ func (p *PromptTemplatePolicy) Mode() policy.ProcessingMode {
 	}
 }
 
-// OnRequest applies template to request body
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *PromptTemplatePolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody applies template to request body.
+func (p *PromptTemplatePolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	var content []byte
 	if ctx.Body != nil {
 		content = ctx.Body.Content

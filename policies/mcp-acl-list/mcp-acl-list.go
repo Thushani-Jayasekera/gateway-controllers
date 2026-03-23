@@ -165,7 +165,13 @@ func (p *McpAclListPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
+// OnRequest delegates to OnRequestBody for v1alpha engine compatibility.
 func (p *McpAclListPolicy) OnRequest(ctx *policy.RequestContext, params map[string]any) policy.RequestAction {
+	return p.OnRequestBody(ctx)
+}
+
+// OnRequestBody enforces ACL rules on the MCP request body.
+func (p *McpAclListPolicy) OnRequestBody(ctx *policy.RequestContext) policy.RequestAction {
 	if !isMcpPostRequest(ctx.Method, ctx.OperationPath) {
 		return nil
 	}
@@ -225,7 +231,13 @@ func (p *McpAclListPolicy) OnRequest(ctx *policy.RequestContext, params map[stri
 	return nil
 }
 
+// OnResponse delegates to OnResponseBody for v1alpha engine compatibility.
 func (p *McpAclListPolicy) OnResponse(ctx *policy.ResponseContext, params map[string]any) policy.ResponseAction {
+	return p.OnResponseBody(ctx)
+}
+
+// OnResponseBody filters MCP capability list responses according to ACL rules.
+func (p *McpAclListPolicy) OnResponseBody(ctx *policy.ResponseContext) policy.ResponseAction {
 	if !isMcpPostRequest(ctx.RequestMethod, ctx.OperationPath) {
 		return nil
 	}

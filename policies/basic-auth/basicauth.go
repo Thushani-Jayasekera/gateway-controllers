@@ -54,6 +54,119 @@ func (p *BasicAuthPolicy) Mode() policy.ProcessingMode {
 	}
 }
 
+// OnRequestHeaders performs Basic Authentication in the request header phase.
+func (p *BasicAuthPolicy) OnRequestHeaders(ctx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
+	expectedUsername, ok := params["username"].(string)
+	if !ok || expectedUsername == "" {
+		errBody, _ := json.Marshal(map[string]string{
+			"error":   "Internal Server Error",
+			"message": "Invalid policy configuration: username must be a non-empty string",
+		})
+		return policy.ImmediateResponse{
+			StatusCode: 500,
+			Headers:    map[string]string{"content-type": "application/json"},
+			Body:       errBody,
+		}
+	}
+
+	expectedPassword, ok := params["password"].(string)
+	if !ok || expectedPassword == "" {
+		errBody, _ := json.Marshal(map[string]string{
+			"error":   "Internal Server Error",
+			"message": "Invalid policy configuration: password must be a non-empty string",
+		})
+		return policy.ImmediateResponse{
+			StatusCode: 500,
+			Headers:    map[string]string{"content-type": "application/json"},
+			Body:       errBody,
+		}
+	}
+
+	allowUnauthenticated := false
+	if allowUnauthRaw, ok := params["allowUnauthenticated"]; ok {
+		if allowUnauthBool, ok := allowUnauthRaw.(bool); ok {
+			allowUnauthenticated = allowUnauthBool
+		}
+	}
+
+	realm := "Restricted"
+	if realmRaw, ok := params["realm"]; ok {
+		if realmStr, ok := realmRaw.(string); ok && realmStr != "" {
+			realm = realmStr
+		}
+	}
+
+	authHeaders := ctx.Headers.Get("authorization")
+	if len(authHeaders) == 0 {
+		return p.handleAuthFailureHeaders(ctx.SharedContext, allowUnauthenticated, realm)
+	}
+
+	authHeader := authHeaders[0]
+	if !strings.HasPrefix(authHeader, "Basic ") {
+		return p.handleAuthFailureHeaders(ctx.SharedContext, allowUnauthenticated, realm)
+	}
+
+	encodedCredentials := strings.TrimPrefix(authHeader, "Basic ")
+	decodedBytes, err := base64.StdEncoding.DecodeString(encodedCredentials)
+	if err != nil {
+		return p.handleAuthFailureHeaders(ctx.SharedContext, allowUnauthenticated, realm)
+	}
+
+	credentials := string(decodedBytes)
+	parts := strings.SplitN(credentials, ":", 2)
+	if len(parts) != 2 {
+		return p.handleAuthFailureHeaders(ctx.SharedContext, allowUnauthenticated, realm)
+	}
+
+	providedUsername := parts[0]
+	providedPassword := parts[1]
+
+	usernameMatch := subtle.ConstantTimeCompare([]byte(providedUsername), []byte(expectedUsername)) == 1
+	passwordMatch := subtle.ConstantTimeCompare([]byte(providedPassword), []byte(expectedPassword)) == 1
+
+	if !usernameMatch || !passwordMatch {
+		return p.handleAuthFailureHeaders(ctx.SharedContext, allowUnauthenticated, realm)
+	}
+
+	ctx.SharedContext.AuthContext = &policy.AuthContext{
+		Authenticated: true,
+		AuthType:      AuthType,
+		Subject:       providedUsername,
+		Previous:      ctx.SharedContext.AuthContext,
+	}
+	return policy.UpstreamRequestHeaderModifications{}
+}
+
+// handleAuthFailureHeaders handles authentication failure in the header phase.
+func (p *BasicAuthPolicy) handleAuthFailureHeaders(shared *policy.SharedContext, allowUnauthenticated bool, realm string) policy.RequestHeaderAction {
+	shared.AuthContext = &policy.AuthContext{
+		Authenticated: false,
+		AuthType:      AuthType,
+		Previous:      shared.AuthContext,
+	}
+
+	if allowUnauthenticated {
+		return policy.UpstreamRequestHeaderModifications{}
+	}
+
+	escapedRealm := strings.ReplaceAll(strings.ReplaceAll(realm, "\\", "\\\\"), "\"", "\\\"")
+	headers := map[string]string{
+		"www-authenticate": fmt.Sprintf("Basic realm=\"%s\"", escapedRealm),
+		"content-type":     "application/json",
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"error":   "Unauthorized",
+		"message": "Authentication required",
+	})
+
+	return policy.ImmediateResponse{
+		StatusCode: 401,
+		Headers:    headers,
+		Body:       body,
+	}
+}
+
 // OnRequest performs Basic Authentication
 func (p *BasicAuthPolicy) OnRequest(ctx *policy.RequestContext, params map[string]interface{}) policy.RequestAction {
 	// Get configuration parameters with safe type assertions
