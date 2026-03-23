@@ -310,26 +310,25 @@ func (p *ContentLengthGuardrailPolicy) validatePayload(payload []byte, params Co
 // StreamingResponsePolicy for SSE (stream: true) responses.
 //
 // max enforcement (early termination):
-//   When only max is configured (no min, no invert), NeedsMoreResponseData
-//   returns false so each SSE event is forwarded immediately. OnResponseBodyChunk
+//   NeedsMoreResponseData returns false immediately (no min gate), so each SSE
+//   chunk is forwarded to OnResponseBodyChunk straight away. OnResponseBodyChunk
 //   maintains a running byte count in ctx.Metadata and injects an SSE error
-//   event as soon as the cumulative delta.content byte length exceeds max.
-//   This terminates the content guardrail at the earliest possible point.
+//   event as soon as the cumulative delta.content byte count exceeds max.
 //
-// min enforcement (full-stream buffering):
-//   When min is configured (or invert=true), the complete stream must be seen
-//   before a pass/fail decision is possible. NeedsMoreResponseData returns true
-//   until [DONE] arrives, causing the kernel to accumulate all chunks. The full
-//   accumulated content is then validated in a single OnResponseBodyChunk call.
-//   Note: with min configured the client receives content only after [DONE], so
-//   the behaviour is equivalent to the buffered OnResponseBody path; the benefit
-//   is that the same chain can early-terminate on a max violation when a
-//   subsequent request uses a max-only configuration.
+// min enforcement (gate-then-stream):
+//   When min is configured, NeedsMoreResponseData buffers silently until the
+//   accumulated delta.content byte count reaches min, then flushes. From that
+//   point OnResponseBodyChunk processes each subsequent chunk individually,
+//   using ctx.Metadata to track the cumulative byte count for max enforcement.
+//
+// invert enforcement:
+//   NeedsMoreResponseData buffers until the byte count exceeds max (guaranteed
+//   outside the excluded range). If [DONE] arrives while still gated, the full
+//   accumulated content is validated in OnResponseBodyChunk.
 
 // NeedsMoreResponseData implements StreamingResponsePolicy.
-// Returns true (buffer everything) when min is configured or invert is set,
-// because those checks require the full response length. Returns false for
-// max-only configurations so chunks flow immediately and can be early-terminated.
+// Buffers until the gate condition is satisfied — no bytes sent to the client
+// during accumulation. Always flushes when [DONE] arrives.
 func (p *ContentLengthGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
 		return false
@@ -339,13 +338,18 @@ func (p *ContentLengthGuardrailPolicy) NeedsMoreResponseData(accumulated []byte)
 	if !isSSEChunk(s) {
 		return false
 	}
-	// Stream is complete — flush regardless of configuration.
+	// Stream is complete — flush for final validation.
 	if strings.Contains(s, sseDataPrefix+sseDone) {
 		return false
 	}
-	// Buffer until [DONE] when min or invert requires the full content.
+	byteCount := len([]byte(extractSSEDeltaContent(s)))
 	rp := p.responseParams
-	return rp.Min > 0 || rp.Invert
+	if rp.Invert {
+		// Invert mode: buffer while still within or below the excluded range.
+		return byteCount <= rp.Max
+	}
+	// Normal mode: buffer while below the required minimum.
+	return rp.Min > 0 && byteCount < rp.Min
 }
 
 // OnResponseBodyChunk implements StreamingResponsePolicy.
@@ -380,8 +384,8 @@ func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx *policy.ResponseS
 
 	isDone := strings.Contains(chunkStr, sseDataPrefix+sseDone)
 
-	// Early termination on max violation (max-only path, no buffering).
-	// Invert mode is excluded here because it needs the full length to decide.
+	// Max violation: terminate early in normal mode at any point.
+	// Invert mode is excluded — it requires the full length at [DONE] to decide.
 	if rp.Max > 0 && !rp.Invert && running > rp.Max {
 		reason := fmt.Sprintf("content length %d bytes is outside the allowed range %d-%d bytes", running, rp.Min, rp.Max)
 		slog.Debug("ContentLengthGuardrail: streaming max violation",
