@@ -475,19 +475,20 @@ func (p *SentenceCountGuardrailPolicy) buildAssessmentObject(reason string, vali
 // StreamingResponsePolicy using a gate-then-stream approach (modelled on the
 // pii-masking reference implementation).
 //
-// NeedsMoreResponseData returns true to silently buffer chunks in the kernel
-// (no bytes sent to the client) until the gate condition is satisfied:
-//   - Normal mode (invert=false): buffer until sentence count >= min.
-//   - Invert mode (invert=true):  buffer until sentence count > max.
-//   - Always flush when [DONE] arrives for final validation.
+// min enforcement (gate-then-stream):
+//   NeedsMoreResponseData buffers silently until the accumulated sentence count
+//   reaches min, then flushes. From that point OnResponseBodyChunk processes
+//   each subsequent chunk individually, using ctx.Metadata to track the
+//   cumulative sentence count for max enforcement.
 //
-// Once flushed, OnResponseBodyChunk receives the full accumulated batch.
-// It tracks a running total in ctx.Metadata (across all flush windows) for
-// accurate max enforcement and final [DONE] validation.
+// invert enforcement:
+//   NeedsMoreResponseData buffers until the sentence count exceeds max
+//   (guaranteed outside the excluded range). If [DONE] arrives while still
+//   gated, the full accumulated content is validated in OnResponseBodyChunk.
 
 // NeedsMoreResponseData implements StreamingResponsePolicy.
-// Returns true to keep accumulating in the kernel until the gate condition is
-// satisfied, suppressing all output to the client during that phase.
+// Buffers until the gate condition is satisfied — no bytes sent to the client
+// during accumulation. Always flushes when [DONE] arrives.
 func (p *SentenceCountGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
 		return false
@@ -496,19 +497,18 @@ func (p *SentenceCountGuardrailPolicy) NeedsMoreResponseData(accumulated []byte)
 	if !isSSEChunk(s) {
 		return false
 	}
-	// Always flush on [DONE] so OnResponseBodyChunk can do final validation.
+	// Stream is complete — flush for final validation.
 	if strings.Contains(s, sseDataPrefix+sseDone) {
 		return false
 	}
-	content := extractSSEDeltaContent(s)
-	count := countSentences(content)
+	count := countSentences(extractSSEDeltaContent(s))
 	rp := p.responseParams
 	if rp.Invert {
 		// Invert mode: buffer while still within or below the excluded range.
 		return count <= rp.Max
 	}
 	// Normal mode: buffer while below the required minimum.
-	return count < rp.Min
+	return rp.Min > 0 && count < rp.Min
 }
 
 // OnResponseBodyChunk implements StreamingResponsePolicy.
