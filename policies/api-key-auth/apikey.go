@@ -88,9 +88,12 @@ func (p *APIKeyPolicy) OnRequest(ctx *policy.RequestContext, params map[string]i
 			"missing or invalid 'in' configuration")
 	}
 
+	issuer, _ := params["issuer"].(string)
+
 	slog.Debug("API Key Auth Policy: Configuration loaded",
 		"keyName", keyName,
 		"location", location,
+		"issuer", issuer,
 	)
 
 	// Extract API key based on location
@@ -154,7 +157,7 @@ func (p *APIKeyPolicy) OnRequest(ctx *policy.RequestContext, params map[string]i
 	)
 
 	// API key was provided - validate it using external validation
-	isValid, err := p.validateAPIKey(apiId, apiOperation, operationMethod, providedKey)
+	isValid, err := p.validateAPIKey(apiId, apiOperation, operationMethod, providedKey, issuer)
 	if err != nil {
 		slog.Debug("API Key Auth Policy: Validation error",
 			"error", err,
@@ -252,9 +255,9 @@ func (p *APIKeyPolicy) handleAuthFailure(ctx *policy.RequestContext, statusCode 
 }
 
 // validateAPIKey validates the provided API key against external store/service
-func (p *APIKeyPolicy) validateAPIKey(apiId, apiOperation, operationMethod, apiKey string) (bool, error) {
+func (p *APIKeyPolicy) validateAPIKey(apiId, apiOperation, operationMethod, apiKey, issuer string) (bool, error) {
 	apiKeyStore := store.GetAPIkeyStoreInstance()
-	isValid, err := apiKeyStore.ValidateAPIKey(apiId, apiOperation, operationMethod, apiKey)
+	isValid, err := apiKeyStore.ValidateAPIKey(apiId, apiOperation, operationMethod, apiKey, issuer)
 	if err != nil {
 		return false, fmt.Errorf("failed to validate API key via the policy engine")
 	}
