@@ -1355,30 +1355,14 @@ func updateToolsInRequestBody(requestBody *map[string]interface{}, toolsPath str
 
 // buildErrorResponse builds an error response
 func (p *SemanticToolFilteringPolicy) buildErrorResponse(message string, err error) policy.RequestAction {
-	errorMsg := message
+	// Log a warning with error details for diagnostics, but do not expose
+	// internal error details to clients. Continue the request unmodified.
 	if err != nil {
-		errorMsg = fmt.Sprintf("%s: %v", message, err)
+		slog.Warn("SemanticToolFiltering: "+message, "error", err)
+	} else {
+		slog.Warn("SemanticToolFiltering: " + message)
 	}
 
-	slog.Error("SemanticToolFiltering: " + errorMsg)
-
-	responseBody := map[string]interface{}{
-		"error": map[string]interface{}{
-			"type":    "SEMANTIC_TOOL_FILTERING",
-			"message": errorMsg,
-		},
-	}
-
-	bodyBytes, err := json.Marshal(responseBody)
-	if err != nil {
-		bodyBytes = []byte(`{"error":{"type":"SEMANTIC_TOOL_FILTERING","message":"Internal error"}}`)
-	}
-
-	return policy.ImmediateResponse{
-		StatusCode: 400,
-		Headers: map[string]string{
-			"Content-Type": "application/json",
-		},
-		Body: bodyBytes,
-	}
+	// Return a pass-through action so the original request proceeds unchanged.
+	return policy.UpstreamRequestModifications{}
 }
