@@ -302,10 +302,10 @@ func parseParams(params map[string]interface{}, p *SemanticToolFilteringPolicy) 
 	if limitRaw, ok := params["limit"]; ok {
 		limit, err := extractInt(limitRaw)
 		if err != nil {
-			return fmt.Errorf("'Limit' must be a number: %w", err)
+			return fmt.Errorf("'limit' must be a number: %w", err)
 		}
 		if limit < 0 || limit > 20 {
-			return fmt.Errorf("'Limit' must be between 0 and 20")
+			return fmt.Errorf("'limit' must be between 0 and 20")
 		}
 		p.topK = limit
 	} else {
@@ -316,10 +316,10 @@ func parseParams(params map[string]interface{}, p *SemanticToolFilteringPolicy) 
 	if thresholdRaw, ok := params["threshold"]; ok {
 		threshold, err := extractFloat64(thresholdRaw)
 		if err != nil {
-			return fmt.Errorf("'Threshold' must be a number: %w", err)
+			return fmt.Errorf("'threshold' must be a number: %w", err)
 		}
 		if threshold < 0.0 || threshold > 1.0 {
-			return fmt.Errorf("'Threshold' must be between 0.0 and 1.0")
+			return fmt.Errorf("'threshold' must be between 0.0 and 1.0")
 		}
 		p.threshold = threshold
 	} else {
