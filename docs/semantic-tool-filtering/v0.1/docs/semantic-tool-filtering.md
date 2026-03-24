@@ -39,7 +39,7 @@ These parameters are configured in the gateway's `config.toml` to set up the emb
 |-----------|------|----------|---------|-------------|
 | embeddingProvider | string | Yes | - | Embedding provider: `OPENAI`, `MISTRAL`, or `AZURE_OPENAI`. |
 | embeddingEndpoint | string | Yes | - | Endpoint URL for the embedding service. |
-| embeddingModel | string | Yes | - | Model name (e.g., `text-embedding-3-small` or `mistral-embed`). |
+| embeddingModel | string | Conditional | - | Model name (e.g., `text-embedding-3-small` or `mistral-embed`). Required for `OPENAI` and `MISTRAL`; optional for `AZURE_OPENAI` (deployment name is derived from the endpoint). |
 | apiKey | string | Yes | - | API key for the embedding service. |
 
 #### Sample System Configuration
