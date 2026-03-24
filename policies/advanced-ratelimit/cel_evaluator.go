@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/cel-go/cel"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 )
 
@@ -137,6 +138,31 @@ func (e *CELEvaluator) EvaluateKeyExpression(expression string, ctx *policy.Requ
 	return strResult, nil
 }
 
+func (e *CELEvaluator) EvaluateKeyExpressionV2(expression string, ctx *policyv1alpha2.RequestContext, routeName string) (string, error) {
+	program, err := e.getOrCompileKeyProgram(expression)
+	if err != nil {
+		return "", fmt.Errorf("failed to compile CEL expression: %w", err)
+	}
+
+	// Build evaluation context
+	evalCtx := buildKeyEvalContextV2(ctx, routeName)
+
+	// Evaluate
+	result, _, err := program.Eval(evalCtx)
+	if err != nil {
+		slog.Debug("CEL key extraction evaluation failed", "expression", expression, "error", err)
+		return "", fmt.Errorf("CEL evaluation failed: %w", err)
+	}
+
+	// Convert to string
+	strResult, ok := result.Value().(string)
+	if !ok {
+		return "", fmt.Errorf("CEL expression must return string, got %T", result.Value())
+	}
+
+	return strResult, nil
+}
+
 // EvaluateRequestCostExpression evaluates a CEL expression for cost extraction from request context
 // Returns the extracted cost value or an error
 func (e *CELEvaluator) EvaluateRequestCostExpression(expression string, ctx *policy.RequestContext) (float64, error) {
@@ -147,6 +173,26 @@ func (e *CELEvaluator) EvaluateRequestCostExpression(expression string, ctx *pol
 
 	// Build evaluation context for request phase
 	evalCtx := buildRequestCostEvalContext(ctx)
+
+	// Evaluate
+	result, _, err := program.Eval(evalCtx)
+	if err != nil {
+		slog.Debug("CEL request cost extraction evaluation failed", "expression", expression, "error", err)
+		return 0, fmt.Errorf("CEL evaluation failed: %w", err)
+	}
+
+	// Convert to float64
+	return toFloat64(result.Value())
+}
+
+func (e *CELEvaluator) EvaluateRequestCostExpressionV2(expression string, ctx *policyv1alpha2.RequestContext) (float64, error) {
+	program, err := e.getOrCompileCostProgram(expression)
+	if err != nil {
+		return 0, fmt.Errorf("failed to compile CEL expression: %w", err)
+	}
+
+	// Build evaluation context for request phase
+	evalCtx := buildRequestCostEvalContextV2(ctx)
 
 	// Evaluate
 	result, _, err := program.Eval(evalCtx)
@@ -212,8 +258,82 @@ func buildKeyEvalContext(ctx *policy.RequestContext, routeName string) map[strin
 	}
 }
 
+func buildKeyEvalContextV2(ctx *policyv1alpha2.RequestContext, routeName string) map[string]interface{} {
+	// Convert headers to map[string][]string for CEL
+	headers := make(map[string][]string)
+	if ctx.Headers != nil {
+		ctx.Headers.Iterate(func(key string, values []string) {
+			headers[key] = values
+		})
+	}
+
+	// Build metadata map
+	metadata := make(map[string]interface{})
+	if ctx.Metadata != nil {
+		for k, v := range ctx.Metadata {
+			metadata[k] = v
+		}
+	}
+
+	return map[string]interface{}{
+		"request.Headers":  headers,
+		"request.Path":     ctx.Path,
+		"request.Method":   ctx.Method,
+		"request.Metadata": metadata,
+		"api.Name":         ctx.APIName,
+		"api.Version":      ctx.APIVersion,
+		"api.Context":      ctx.APIContext,
+		"api.Id":           ctx.APIId,
+		"route.Name":       routeName,
+	}
+}
+
 // buildRequestCostEvalContext builds the CEL evaluation context for request-phase cost extraction
 func buildRequestCostEvalContext(ctx *policy.RequestContext) map[string]interface{} {
+	// Convert headers to map[string][]string for CEL
+	headers := make(map[string][]string)
+	if ctx.Headers != nil {
+		ctx.Headers.Iterate(func(key string, values []string) {
+			headers[key] = values
+		})
+	}
+
+	// Build metadata map
+	metadata := make(map[string]interface{})
+	if ctx.Metadata != nil {
+		for k, v := range ctx.Metadata {
+			metadata[k] = v
+		}
+	}
+
+	// Get body content
+	var bodyBytes []byte
+	var bodyString string
+	if ctx.Body != nil && ctx.Body.Present && ctx.Body.Content != nil {
+		bodyBytes = ctx.Body.Content
+		bodyString = string(bodyBytes)
+	}
+
+	return map[string]interface{}{
+		"request.Headers":    headers,
+		"request.Body":       bodyBytes,
+		"request.BodyString": bodyString,
+		"request.Path":       ctx.Path,
+		"request.Method":     ctx.Method,
+		"request.Metadata":   metadata,
+		// Response variables are empty during request phase
+		"response.Headers":    map[string][]string{},
+		"response.Body":       []byte{},
+		"response.BodyString": "",
+		"response.Status":     int64(0),
+		"api.Name":            ctx.APIName,
+		"api.Version":         ctx.APIVersion,
+		"api.Context":         ctx.APIContext,
+		"api.Id":              ctx.APIId,
+	}
+}
+
+func buildRequestCostEvalContextV2(ctx *policyv1alpha2.RequestContext) map[string]interface{} {
 	// Convert headers to map[string][]string for CEL
 	headers := make(map[string][]string)
 	if ctx.Headers != nil {

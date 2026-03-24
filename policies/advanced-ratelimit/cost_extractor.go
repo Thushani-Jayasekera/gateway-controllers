@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	utils "github.com/wso2/api-platform/sdk/utils"
 )
@@ -109,6 +110,64 @@ func (e *CostExtractor) ExtractRequestCost(ctx *policy.RequestContext) (float64,
 			"jsonPath", source.JSONPath)
 
 		val, ok := e.extractFromRequestSource(ctx, source)
+		if ok {
+			found = true
+			total += val * source.Multiplier
+			slog.Debug("Request cost extracted from source",
+				"type", source.Type,
+				"key", source.Key,
+				"jsonPath", source.JSONPath,
+				"rawValue", val,
+				"multiplier", source.Multiplier,
+				"contribution", val*source.Multiplier)
+		} else {
+			slog.Debug("Failed to extract cost from source",
+				"type", source.Type,
+				"key", source.Key)
+		}
+	}
+
+	if !found {
+		slog.Debug("All request cost extraction sources failed, using default",
+			"default", e.config.Default)
+		return e.config.Default, false
+	}
+
+	if total < 0 {
+		slog.Warn("Total cost from request sources is negative; clamping to zero", "cost", total)
+		total = 0
+	}
+
+	slog.Debug("Request cost extracted successfully", "totalCost", total)
+	return total, true
+}
+
+func (e *CostExtractor) ExtractRequestCostV2(ctx *policyv1alpha2.RequestContext) (float64, bool) {
+	if !e.config.Enabled {
+		slog.Debug("Cost extraction disabled, returning default", "default", e.config.Default)
+		return e.config.Default, false
+	}
+
+	slog.Debug("Extracting request cost",
+		"sourceCount", len(e.config.Sources),
+		"default", e.config.Default)
+
+	var total float64
+	var found bool
+
+	for _, source := range e.config.Sources {
+		if !isRequestPhaseSource(source.Type) {
+			slog.Debug("Skipping non-request phase source",
+				"type", source.Type)
+			continue
+		}
+
+		slog.Debug("Attempting request cost extraction",
+			"type", source.Type,
+			"key", source.Key,
+			"jsonPath", source.JSONPath)
+
+		val, ok := e.extractFromRequestSourceV2(ctx, source)
 		if ok {
 			found = true
 			total += val * source.Multiplier
@@ -238,6 +297,21 @@ func (e *CostExtractor) extractFromRequestSource(ctx *policy.RequestContext, sou
 	}
 }
 
+func (e *CostExtractor) extractFromRequestSourceV2(ctx *policyv1alpha2.RequestContext, source CostSource) (float64, bool) {
+	switch source.Type {
+	case CostSourceRequestHeader:
+		return e.extractFromRequestHeaderV2(ctx, source.Key)
+	case CostSourceRequestMetadata:
+		return e.extractFromRequestMetadataV2(ctx, source.Key)
+	case CostSourceRequestBody:
+		return e.extractFromRequestBodyV2(ctx, source.JSONPath)
+	case CostSourceRequestCEL:
+		return e.extractFromRequestCELV2(ctx, source.Expression)
+	default:
+		return 0, false
+	}
+}
+
 // extractFromResponseSource extracts cost from a single response-phase source
 func (e *CostExtractor) extractFromResponseSource(ctx *policy.ResponseContext, source CostSource) (float64, bool) {
 	switch source.Type {
@@ -277,13 +351,48 @@ func (e *CostExtractor) extractFromRequestHeader(ctx *policy.RequestContext, hea
 	return cost, true
 }
 
+func (e *CostExtractor) extractFromRequestHeaderV2(ctx *policyv1alpha2.RequestContext, headerName string) (float64, bool) {
+	if ctx.Headers == nil {
+		return 0, false
+	}
+
+	values := ctx.Headers.Get(strings.ToLower(headerName))
+	if len(values) == 0 || values[0] == "" {
+		return 0, false
+	}
+
+	cost, err := strconv.ParseFloat(values[0], 64)
+	if err != nil {
+		slog.Warn("Failed to parse cost from request header",
+			"header", headerName,
+			"value", values[0],
+			"error", err)
+		return 0, false
+	}
+
+	return cost, true
+}
+
 // extractFromRequestMetadata extracts cost from request metadata
 func (e *CostExtractor) extractFromRequestMetadata(ctx *policy.RequestContext, key string) (float64, bool) {
 	return extractFromMetadataMap(ctx.Metadata, key)
 }
 
+func (e *CostExtractor) extractFromRequestMetadataV2(ctx *policyv1alpha2.RequestContext, key string) (float64, bool) {
+	return extractFromMetadataMap(ctx.Metadata, key)
+}
+
 // extractFromRequestBody extracts cost from request body using JSONPath
 func (e *CostExtractor) extractFromRequestBody(ctx *policy.RequestContext, jsonPath string) (float64, bool) {
+	if ctx.Body == nil || !ctx.Body.Present {
+		return 0, false
+	}
+
+	return extractFromBodyBytes(ctx.Body.Content, jsonPath)
+}
+
+// extractFromRequestBody extracts cost from request body using JSONPath
+func (e *CostExtractor) extractFromRequestBodyV2(ctx *policyv1alpha2.RequestContext, jsonPath string) (float64, bool) {
 	if ctx.Body == nil || !ctx.Body.Present {
 		return 0, false
 	}
@@ -344,6 +453,24 @@ func (e *CostExtractor) extractFromRequestCEL(ctx *policy.RequestContext, expres
 	}
 
 	cost, err := evaluator.EvaluateRequestCostExpression(expression, ctx)
+	if err != nil {
+		slog.Debug("CEL request cost extraction failed",
+			"expression", expression,
+			"error", err)
+		return 0, false
+	}
+
+	return cost, true
+}
+
+func (e *CostExtractor) extractFromRequestCELV2(ctx *policyv1alpha2.RequestContext, expression string) (float64, bool) {
+	evaluator, err := GetCELEvaluator()
+	if err != nil {
+		slog.Error("Failed to get CEL evaluator for request cost extraction", "error", err)
+		return 0, false
+	}
+
+	cost, err := evaluator.EvaluateRequestCostExpressionV2(expression, ctx)
 	if err != nil {
 		slog.Debug("CEL request cost extraction failed",
 			"expression", expression,
