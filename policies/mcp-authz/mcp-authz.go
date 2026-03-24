@@ -28,6 +28,8 @@ import (
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 )
 
+// TODO
+
 const (
 	WWWAuthenticateHeader     = "WWW-Authenticate"
 	AuthMethodBearer          = "Bearer resource_metadata="
