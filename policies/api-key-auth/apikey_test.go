@@ -176,11 +176,11 @@ func TestAPIKeyPolicy_OnRequestHeaders_FailsWhenValidationReturnsFalse(t *testin
 
 func TestAPIKeyPolicy_OnRequestHeaders_FailsWhenValidationErrors(t *testing.T) {
 	resetAPIKeyStore(t)
-	seedExternalAPIKey(t, "api-1", "bad-ops-secret", `not-json`)
+	// Do not seed any key for "api-1" so ValidateAPIKey returns ErrNotFound.
 
 	p := &APIKeyPolicy{}
 	ctx := newRequestHeaderContext(t, "GET", "/orders", map[string][]string{
-		"x-api-key": {"bad-ops-secret"},
+		"x-api-key": {"no-matching-key"},
 	}, "api-1", "OrdersAPI", "v1", "/orders")
 
 	action := p.OnRequestHeaders(ctx, map[string]interface{}{
