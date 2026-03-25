@@ -35,6 +35,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/wso2/api-platform/sdk v0.3.8 h1:zQEjxdVsk11NxYVSrtf/QQSK2ZpAFFyD8GNgcVWTVtc=
 github.com/wso2/api-platform/sdk v0.3.8/go.mod h1:sY7oEU0IBf+FzUnnBmW0DjqmXZ+vGikGH3Ar9sNgrdc=
+github.com/wso2/api-platform/sdk/core v0.1.0 h1:yxxlgmrZLztCqHzAW7GdRnUNBFOA2l8AX6fphMZaly0=
+github.com/wso2/api-platform/sdk/core v0.1.0/go.mod h1:R114dV8/EAl843+16zi97Cbd5+iPPYjHKdN7Nik3EUw=
 github.com/wso2/gateway-controllers/policies/advanced-ratelimit v0.3.2 h1:5e7NxjXhgNq168MpBUOjUDIBjJMN40b48evixpn0X68=
 github.com/wso2/gateway-controllers/policies/advanced-ratelimit v0.3.2/go.mod h1:zjPJeiHlwgHVoPOcS3/F0NYEwqd+IIwXlE2gvjDcAIk=
 golang.org/x/crypto v0.47.0 h1:V6e3FRj+n4dbpw86FJ8Fv7XVOql7TEwpHapKoMJ/GO8=

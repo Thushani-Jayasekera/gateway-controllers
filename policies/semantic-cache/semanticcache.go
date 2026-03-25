@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	utils "github.com/wso2/api-platform/sdk/utils"
 	embeddingproviders "github.com/wso2/api-platform/sdk/utils/embeddingproviders"
@@ -49,7 +50,10 @@ type SemanticCachePolicy struct {
 	threshold           float64
 }
 
-// GetPolicy creates a new instance of the semantic cache policy
+// GetPolicy is the v1alpha factory entry point (loaded by v1alpha kernels).
+// The returned concrete type also satisfies policyv1alpha2 phase interfaces
+// (StreamingResponsePolicy, RequestPolicy, ResponsePolicy), so v1alpha2 kernels
+// can discover those capabilities via type assertions even when using this factory.
 func GetPolicy(
 	metadata policy.PolicyMetadata,
 	params map[string]interface{},
@@ -83,6 +87,20 @@ func GetPolicy(
 	slog.Debug("SemanticCache: Policy initialized", "embeddingProvider", embeddingProvider, "vectorStoreProvider", vectorStoreProvider, "similarityThreshold", p.threshold)
 
 	return p, nil
+}
+
+// GetPolicyV2 is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
+func GetPolicyV2(
+	metadata policyv1alpha2.PolicyMetadata,
+	params map[string]interface{},
+) (policyv1alpha2.Policy, error) {
+	return GetPolicy(policy.PolicyMetadata{
+		RouteName:  metadata.RouteName,
+		APIId:      metadata.APIId,
+		APIName:    metadata.APIName,
+		APIVersion: metadata.APIVersion,
+		AttachedTo: policy.Level(metadata.AttachedTo),
+	}, params)
 }
 
 // parseParams parses and validates parameters from the params map
@@ -473,6 +491,120 @@ func (p *SemanticCachePolicy) buildErrorResponse(message string, err error) poli
 	}
 
 	return policy.ImmediateResponse{
+		StatusCode: 400,
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+		Body: bodyBytes,
+	}
+}
+
+// OnResponseBody handles response body processing for semantic caching.
+func (p *SemanticCachePolicy) OnResponseBody(ctx *policyv1alpha2.ResponseContext, _ map[string]interface{}) policyv1alpha2.ResponseAction {
+	return p.processResponseBodyV2(ctx)
+}
+
+// processResponseBody handles response body processing for semantic caching.
+func (p *SemanticCachePolicy) processResponseBodyV2(ctx *policyv1alpha2.ResponseContext) policyv1alpha2.ResponseAction {
+	// Only cache successful responses (200 status code)
+	if ctx.ResponseStatus != 200 {
+		slog.Debug("SemanticCache: Skipping cache for non-200 response", "statusCode", ctx.ResponseStatus)
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	var content []byte
+	if ctx.ResponseBody != nil {
+		content = ctx.ResponseBody.Content
+	}
+
+	if len(content) == 0 {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	// Retrieve embedding from metadata (stored in request phase)
+	embeddingStr, ok := ctx.Metadata[MetadataKeyEmbedding].(string)
+	if !ok || embeddingStr == "" {
+		slog.Debug("SemanticCache: No embedding found in metadata, skipping cache storage")
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	// Deserialize embedding
+	var embedding []float32
+	if err := json.Unmarshal([]byte(embeddingStr), &embedding); err != nil {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	// Parse response body
+	var responseData map[string]interface{}
+	if err := json.Unmarshal(content, &responseData); err != nil {
+		if isSSEResponse(ctx.ResponseHeaders) {
+			slog.Info("SemanticCache: Skipping cache storage for streaming response; buffered SSE events are not supported")
+		} else {
+			slog.Info("SemanticCache: Failed to parse response body, skipping cache storage", "error", err)
+		}
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	// Get API ID from context (use APIName and APIVersion to create unique ID)
+	apiID := fmt.Sprintf("%s:%s", ctx.APIName, ctx.APIVersion)
+	if apiID == ":" {
+		// Fallback to route name if API info not available
+		apiID = ctx.RequestID
+	}
+
+	// Store in cache
+	cacheResponse := vectordbproviders.CacheResponse{
+		ResponsePayload:     responseData,
+		RequestHash:         uuid.New().String(),
+		ResponseFetchedTime: time.Now(),
+	}
+
+	cacheFilter := map[string]interface{}{
+		"api_id": apiID,
+		"ctx":    context.Background(), // Vector DB providers need context
+	}
+
+	if err := p.vectorStoreProvider.Store(embedding, cacheResponse, cacheFilter); err != nil {
+		slog.Debug("SemanticCache: Error storing in cache", "error", err, "apiID", apiID)
+		// Log error but don't modify response
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	slog.Debug("SemanticCache: Response cached successfully", "apiID", apiID)
+	return policyv1alpha2.DownstreamResponseModifications{}
+}
+
+// isSSEResponse reports whether the response Content-Type indicates an SSE stream.
+func isSSEResponse(headers *policyv1alpha2.Headers) bool {
+	if headers == nil {
+		return false
+	}
+	for _, v := range headers.Get("content-type") {
+		if v == "text/event-stream" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildErrorResponseV2 builds a v1alpha2 error response for JSONPath extraction failures.
+func (p *SemanticCachePolicy) buildErrorResponseV2(message string, err error) policyv1alpha2.RequestAction {
+	errorMsg := message
+	if err != nil {
+		errorMsg = fmt.Sprintf("%s: %v", message, err)
+	}
+
+	responseBody := map[string]interface{}{
+		"type":    "SEMANTIC_CACHE",
+		"message": errorMsg,
+	}
+
+	bodyBytes, marshalErr := json.Marshal(responseBody)
+	if marshalErr != nil {
+		bodyBytes = []byte(`{"type":"SEMANTIC_CACHE","message":"Internal error"}`)
+	}
+
+	return policyv1alpha2.ImmediateResponse{
 		StatusCode: 400,
 		Headers: map[string]string{
 			"Content-Type": "application/json",

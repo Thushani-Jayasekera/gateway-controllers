@@ -21,16 +21,22 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"unicode"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 )
 
 const (
 	upstreamPayloadFormatXML  = "xml"
 	upstreamPayloadFormatJSON = "json"
+
+	// sseDataPrefix is the line prefix used in Server-Sent Events payloads.
+	// Used only for detection — SSE bodies are passed through without conversion.
+	sseDataPrefix = "data: "
 )
 
 // JSONXMLMediationPolicy mediates request/response payloads between JSON and XML.
@@ -39,6 +45,10 @@ type JSONXMLMediationPolicy struct {
 	downstreamPayloadFormat string
 }
 
+// GetPolicy is the v1alpha factory entry point (loaded by v1alpha kernels).
+// The returned concrete type also satisfies policyv1alpha2 phase interfaces
+// (StreamingResponsePolicy, RequestPolicy, ResponsePolicy), so v1alpha2 kernels
+// can discover those capabilities via type assertions even when using this factory.
 func GetPolicy(
 	metadata policy.PolicyMetadata,
 	params map[string]interface{},
@@ -60,6 +70,20 @@ func GetPolicy(
 		upstreamPayloadFormat:   upstreamPayloadFormat,
 		downstreamPayloadFormat: downstreamPayloadFormat,
 	}, nil
+}
+
+// GetPolicyV2 is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
+func GetPolicyV2(
+	metadata policyv1alpha2.PolicyMetadata,
+	params map[string]interface{},
+) (policyv1alpha2.Policy, error) {
+	return GetPolicy(policy.PolicyMetadata{
+		RouteName:  metadata.RouteName,
+		APIId:      metadata.APIId,
+		APIName:    metadata.APIName,
+		APIVersion: metadata.APIVersion,
+		AttachedTo: policy.Level(metadata.AttachedTo),
+	}, params)
 }
 
 // Mode returns the processing mode for this policy.
@@ -498,4 +522,149 @@ type XMLNode struct {
 	Attrs   []xml.Attr `xml:",any,attr"`
 	Content string     `xml:",chardata"`
 	Nodes   []XMLNode  `xml:",any"`
+}
+
+// ─── v1alpha2 body methods ────────────────────────────────────────────────────
+
+// OnRequestBody converts the request body from the downstream payload format to
+// the upstream payload format before forwarding to the upstream service.
+func (p *JSONXMLMediationPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, _ map[string]interface{}) policyv1alpha2.RequestAction {
+	if ctx.Body == nil || !ctx.Body.Present || len(ctx.Body.Content) == 0 {
+		return policyv1alpha2.UpstreamRequestModifications{}
+	}
+
+	contentType := getFirstHeaderV2(ctx.Headers, "content-type")
+	if !matchesContentType(contentType, p.downstreamPayloadFormat) {
+		return p.handleInternalServerErrorV2(fmt.Sprintf(
+			"Content-Type must be %s for downstream payload format %s",
+			expectedContentTypeMessage(p.downstreamPayloadFormat),
+			p.downstreamPayloadFormat,
+		))
+	}
+
+	convertedBody, convertedContentType, convErr := p.convertBetweenFormats(
+		ctx.Body.Content,
+		p.downstreamPayloadFormat,
+		p.upstreamPayloadFormat,
+	)
+	if convErr != nil {
+		return p.handleInternalServerErrorV2(convErr.Error())
+	}
+
+	return policyv1alpha2.UpstreamRequestModifications{
+		Body: convertedBody,
+		UpstreamRequestHeaderModifications: policyv1alpha2.UpstreamRequestHeaderModifications{
+			HeadersToSet: map[string]string{
+				"content-type":   convertedContentType,
+				"content-length": fmt.Sprintf("%d", len(convertedBody)),
+			},
+		},
+	}
+}
+
+// OnResponseBody converts the upstream response body to the downstream payload format.
+func (p *JSONXMLMediationPolicy) OnResponseBody(ctx *policyv1alpha2.ResponseContext, _ map[string]interface{}) policyv1alpha2.ResponseAction {
+	if ctx.ResponseBody == nil || !ctx.ResponseBody.Present || len(ctx.ResponseBody.Content) == 0 {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	// SSE (streaming) responses cannot be converted: the buffered body contains
+	// chat.completion.chunk events with delta fields, which have a fundamentally
+	// different structure from the full chat.completion JSON returned by
+	// non-streaming calls. Pass through and warn so operators know to disable
+	// streaming if they need format conversion.
+	if isSSEResponse(string(ctx.ResponseBody.Content)) {
+		slog.Warn("json-xml-mediator: SSE response detected — passing through without conversion. " +
+			"Set stream: false on the upstream request to enable JSON↔XML mediation.")
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	contentType := getFirstHeaderV2(ctx.ResponseHeaders, "content-type")
+	if !matchesContentType(contentType, p.upstreamPayloadFormat) {
+		return p.handleInternalServerErrorResponseV2(fmt.Sprintf(
+			"Content-Type must be %s in response for upstream payload format %s",
+			expectedContentTypeMessage(p.upstreamPayloadFormat),
+			p.upstreamPayloadFormat,
+		))
+	}
+
+	convertedBody, convertedContentType, convErr := p.convertBetweenFormats(
+		ctx.ResponseBody.Content,
+		p.upstreamPayloadFormat,
+		p.downstreamPayloadFormat,
+	)
+	if convErr != nil {
+		return p.handleInternalServerErrorResponseV2(convErr.Error())
+	}
+
+	return policyv1alpha2.DownstreamResponseModifications{
+		Body: convertedBody,
+		DownstreamResponseHeaderModifications: policyv1alpha2.DownstreamResponseHeaderModifications{
+			HeadersToSet: map[string]string{
+				"content-type":   convertedContentType,
+				"content-length": fmt.Sprintf("%d", len(convertedBody)),
+			},
+		},
+	}
+}
+
+// ─── SSE detection ────────────────────────────────────────────────────────────
+
+// isSSEResponse reports whether the body looks like a Server-Sent Events
+// payload by checking for a "data: " prefix in the first few lines.
+func isSSEResponse(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *JSONXMLMediationPolicy) handleInternalServerErrorV2(message string) policyv1alpha2.RequestAction {
+	errorResponse := map[string]interface{}{
+		"error":   "Internal Server Error",
+		"message": message,
+	}
+	bodyBytes, _ := json.Marshal(errorResponse)
+
+	return policyv1alpha2.ImmediateResponse{
+		StatusCode: 500,
+		Headers: map[string]string{
+			"content-type":   "application/json",
+			"content-length": fmt.Sprintf("%d", len(bodyBytes)),
+		},
+		Body: bodyBytes,
+	}
+}
+
+func getFirstHeaderV2(headers *policyv1alpha2.Headers, key string) string {
+	if headers == nil {
+		return ""
+	}
+	vals := headers.Get(key)
+	if len(vals) == 0 {
+		return ""
+	}
+	return strings.ToLower(vals[0])
+}
+
+func (p *JSONXMLMediationPolicy) handleInternalServerErrorResponseV2(message string) policyv1alpha2.ResponseAction {
+	errorResponse := map[string]interface{}{
+		"error":   "Internal Server Error",
+		"message": message,
+	}
+	bodyBytes, _ := json.Marshal(errorResponse)
+
+	statusCode := 500
+	return policyv1alpha2.DownstreamResponseModifications{
+		StatusCode: &statusCode,
+		Body:       bodyBytes,
+		DownstreamResponseHeaderModifications: policyv1alpha2.DownstreamResponseHeaderModifications{
+			HeadersToSet: map[string]string{
+				"content-type":   "application/json",
+				"content-length": fmt.Sprintf("%d", len(bodyBytes)),
+			},
+		},
+	}
 }

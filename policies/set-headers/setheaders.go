@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 )
 
@@ -35,10 +36,22 @@ type SetHeadersPolicy struct{}
 
 var ins = &SetHeadersPolicy{}
 
+// GetPolicy is the v1alpha factory entry point (loaded by v1alpha kernels).
+// The returned concrete type also satisfies policyv1alpha2 phase interfaces
+// (StreamingResponsePolicy, RequestPolicy, ResponsePolicy), so v1alpha2 kernels
+// can discover those capabilities via type assertions even when using this factory.
 func GetPolicy(
 	metadata policy.PolicyMetadata,
 	params map[string]interface{},
 ) (policy.Policy, error) {
+	return ins, nil
+}
+
+// GetPolicyV2 is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
+func GetPolicyV2(
+	metadata policyv1alpha2.PolicyMetadata,
+	params map[string]interface{},
+) (policyv1alpha2.Policy, error) {
 	return ins, nil
 }
 
@@ -237,5 +250,47 @@ func (p *SetHeadersPolicy) OnResponse(ctx *policy.ResponseContext, params map[st
 
 	return policy.UpstreamResponseModifications{
 		SetHeaders: setHeaders,
+	}
+}
+
+// buildRequestHeaders extracts and parses request headers from params.
+// Returns nil if no headers are configured.
+func (p *SetHeadersPolicy) buildRequestHeaders(params map[string]interface{}) map[string]string {
+	headersRaw, ok, err := p.getPhaseHeaders(params, "request", "requestHeaders")
+	if err != nil || !ok {
+		return nil
+	}
+	entries := p.parseHeaderEntries(headersRaw)
+	if len(entries) == 0 {
+		return nil
+	}
+	return p.convertToSetHeaderMap(entries)
+}
+
+// OnRequestHeaders sets headers on the request (v2alpha.RequestHeaderPolicy).
+func (p *SetHeadersPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]interface{}) policyv1alpha2.RequestHeaderAction {
+	return policyv1alpha2.UpstreamRequestHeaderModifications{
+		HeadersToSet: p.buildRequestHeaders(params),
+	}
+}
+
+// buildResponseHeaders extracts and parses response headers from params.
+// Returns nil if no headers are configured.
+func (p *SetHeadersPolicy) buildResponseHeaders(params map[string]interface{}) map[string]string {
+	headersRaw, ok, err := p.getPhaseHeaders(params, "response", "responseHeaders")
+	if err != nil || !ok {
+		return nil
+	}
+	entries := p.parseHeaderEntries(headersRaw)
+	if len(entries) == 0 {
+		return nil
+	}
+	return p.convertToSetHeaderMap(entries)
+}
+
+// OnResponseHeaders sets headers on the response (v2alpha.ResponseHeaderPolicy).
+func (p *SetHeadersPolicy) OnResponseHeaders(ctx *policyv1alpha2.ResponseHeaderContext, params map[string]interface{}) policyv1alpha2.ResponseHeaderAction {
+	return policyv1alpha2.DownstreamResponseHeaderModifications{
+		HeadersToSet: p.buildResponseHeaders(params),
 	}
 }

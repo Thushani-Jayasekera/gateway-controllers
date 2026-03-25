@@ -23,16 +23,28 @@ import (
 	"log/slog"
 	"strings"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 )
 
 var ins = &AnalyticsHeaderFilterPolicy{}
 
-// GetPolicy returns the policy instance
+// GetPolicy is the v1alpha factory entry point (loaded by v1alpha kernels).
+// The returned concrete type also satisfies policyv1alpha2 phase interfaces
+// (StreamingResponsePolicy, RequestPolicy, ResponsePolicy), so v1alpha2 kernels
+// can discover those capabilities via type assertions even when using this factory.
 func GetPolicy(
 	metadata policy.PolicyMetadata,
 	params map[string]interface{},
 ) (policy.Policy, error) {
+	return ins, nil
+}
+
+// GetPolicyV2 is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
+func GetPolicyV2(
+	metadata policyv1alpha2.PolicyMetadata,
+	params map[string]interface{},
+) (policyv1alpha2.Policy, error) {
 	return ins, nil
 }
 
@@ -170,6 +182,52 @@ func (p *AnalyticsHeaderFilterPolicy) OnResponse(ctx *policy.ResponseContext, pa
 	// Set DropHeadersFromAnalytics action (no processing, just pass the config)
 	return policy.UpstreamResponseModifications{
 		DropHeadersFromAnalytics: policy.DropHeaderAction{
+			Action:  mode,
+			Headers: specifiedHeaders,
+		},
+	}
+}
+
+// OnRequestHeaders processes request headers for analytics filtering in the header phase.
+func (p *AnalyticsHeaderFilterPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]interface{}) policyv1alpha2.RequestHeaderAction {
+	requestConfigRaw, hasRequestConfig := params["request"]
+	if !hasRequestConfig || requestConfigRaw == nil {
+		return policyv1alpha2.UpstreamRequestHeaderModifications{}
+	}
+
+	mode, specifiedHeaders, err := p.parseHeaderFilterConfig(requestConfigRaw)
+	if err != nil {
+		slog.Warn("Analytics Header Filter Policy: Failed to parse request headers filter config", "error", err)
+		return policyv1alpha2.UpstreamRequestHeaderModifications{}
+	}
+
+	slog.Debug("Analytics Header Filter Policy: Parsed request config",
+		"mode", mode,
+		"headers", specifiedHeaders)
+
+	return policyv1alpha2.UpstreamRequestHeaderModifications{
+		AnalyticsHeaderFilter: policyv1alpha2.DropHeaderAction{
+			Action:  mode,
+			Headers: specifiedHeaders,
+		},
+	}
+}
+
+// OnResponseHeaders processes response headers for analytics filtering in the header phase.
+func (p *AnalyticsHeaderFilterPolicy) OnResponseHeaders(ctx *policyv1alpha2.ResponseHeaderContext, params map[string]interface{}) policyv1alpha2.ResponseHeaderAction {
+	responseConfigRaw, hasResponseConfig := params["response"]
+	if !hasResponseConfig || responseConfigRaw == nil {
+		return policyv1alpha2.DownstreamResponseHeaderModifications{}
+	}
+
+	mode, specifiedHeaders, err := p.parseHeaderFilterConfig(responseConfigRaw)
+	if err != nil {
+		slog.Warn("Analytics Header Filter Policy: Failed to parse response headers filter config", "error", err)
+		return policyv1alpha2.DownstreamResponseHeaderModifications{}
+	}
+
+	return policyv1alpha2.DownstreamResponseHeaderModifications{
+		AnalyticsHeaderFilter: policyv1alpha2.DropHeaderAction{
 			Action:  mode,
 			Headers: specifiedHeaders,
 		},

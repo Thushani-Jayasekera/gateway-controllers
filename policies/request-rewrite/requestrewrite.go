@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strings"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 )
 
@@ -44,18 +45,34 @@ const (
 	queryActionReplaceRegex = "REPLACEREGEXMATCH"
 )
 
+// headersGetter is satisfied by both *policyv1alpha.Headers and *policyv1alpha2.Headers.
+type headersGetter interface {
+	Get(name string) []string
+}
+
 var ins = &RequestRewritePolicy{}
 
 // RequestRewritePolicy implements request rewriting (path, query, method)
 type RequestRewritePolicy struct{}
 
-// GetPolicy returns the policy instance
+// GetPolicy is the v1alpha factory entry point (loaded by v1alpha kernels).
+// The returned concrete type also satisfies policyv1alpha2 phase interfaces
+// (StreamingResponsePolicy, RequestPolicy, ResponsePolicy), so v1alpha2 kernels
+// can discover those capabilities via type assertions even when using this factory.
 func GetPolicy(metadata policy.PolicyMetadata, params map[string]interface{}) (policy.Policy, error) {
 	slog.Debug("[Request Rewrite]: GetPolicy called",
 		"route", metadata.RouteName,
 		"api", metadata.APIName,
 		"version", metadata.APIVersion,
 	)
+	return ins, nil
+}
+
+// GetPolicyV2 is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
+func GetPolicyV2(
+	metadata policyv1alpha2.PolicyMetadata,
+	params map[string]interface{},
+) (policyv1alpha2.Policy, error) {
 	return ins, nil
 }
 
@@ -137,7 +154,7 @@ func (p *RequestRewritePolicy) OnRequest(ctx *policy.RequestContext, params map[
 
 	originalPath := ctx.Path
 	pathOnly, queryValues, _ := splitPathAndQuery(originalPath)
-	basePrefix, relativePath := splitBasePath(ctx, pathOnly)
+	basePrefix, relativePath := splitBasePath(ctx.APIContext, pathOnly)
 	updatedRelativePath := relativePath
 	pathRewriteApplied := false
 	queryRewriteConfigured := cfg.QueryRewrite != nil
@@ -153,7 +170,7 @@ func (p *RequestRewritePolicy) OnRequest(ctx *policy.RequestContext, params map[
 				pathRewriteApplied = true
 			}
 		} else {
-			updatedRelativePath = applyPathRewrite(ctx, updatedRelativePath, cfg.PathRewrite)
+			updatedRelativePath = applyPathRewrite(ctx.OperationPath, updatedRelativePath, cfg.PathRewrite)
 			pathRewriteApplied = updatedRelativePath != relativePath
 		}
 	}
@@ -331,12 +348,12 @@ func matchQueryParam(values url.Values, matcher queryParamMatch) bool {
 	}
 }
 
-func applyPathRewrite(ctx *policy.RequestContext, currentPath string, cfg *pathRewrite) string {
+func applyPathRewrite(operationPath string, currentPath string, cfg *pathRewrite) string {
 	rewriteType := strings.ToUpper(strings.TrimSpace(cfg.Type))
 
 	switch rewriteType {
 	case pathReplacePrefix:
-		operationPath := strings.TrimSpace(ctx.OperationPath)
+		operationPath := strings.TrimSpace(operationPath)
 		if operationPath == "" {
 			slog.Warn("[Request Rewrite]: Operation path is empty, skipping prefix rewrite")
 			return currentPath
@@ -371,8 +388,8 @@ func applyPathRewrite(ctx *policy.RequestContext, currentPath string, cfg *pathR
 	}
 }
 
-func splitBasePath(ctx *policy.RequestContext, pathOnly string) (string, string) {
-	base := strings.TrimSpace(ctx.APIContext)
+func splitBasePath(apiContext string, pathOnly string) (string, string) {
+	base := strings.TrimSpace(apiContext)
 	if base == "" || base == "/" {
 		return "", pathOnly
 	}
@@ -483,6 +500,167 @@ func isAllowedMethod(method string) bool {
 	case "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS":
 		return true
 	default:
+		return false
+	}
+}
+
+// OnRequestHeaders applies request transformations in the header phase for v2alpha engine compatibility.
+func (p *RequestRewritePolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]interface{}) policyv1alpha2.RequestHeaderAction {
+	newPath, newMethod, err := p.computeRewrite(ctx, params)
+	if err != nil {
+		slog.Error("[Request Rewrite]: Configuration error", "error", err)
+		body, _ := json.Marshal(map[string]string{
+			"error":   "Configuration Error",
+			"message": err.Error(),
+		})
+		return policyv1alpha2.ImmediateResponse{
+			StatusCode: 500,
+			Headers:    map[string]string{"content-type": "application/json"},
+			Body:       body,
+		}
+	}
+	return policyv1alpha2.UpstreamRequestHeaderModifications{
+		Path:   newPath,
+		Method: newMethod,
+	}
+}
+
+// computeRewrite parses config and computes path/method rewrites from the provided request fields.
+// Called from both OnRequestHeaders and OnRequestBody to share logic without duplication.
+func (p *RequestRewritePolicy) computeRewrite(ctx *policyv1alpha2.RequestHeaderContext, params map[string]interface{}) (newPath *string, newMethod *string, err error) {
+	cfg, parseErr := parseConfig(params)
+	if parseErr != nil {
+		return nil, nil, parseErr
+	}
+
+	if cfg == nil {
+		slog.Debug("[Request Rewrite]: No configuration provided, passing through")
+		return nil, nil, nil
+	}
+
+	if !matchesRequestV2(ctx, cfg.Match) {
+		slog.Debug("[Request Rewrite]: Match conditions not met, skipping transformations")
+		return nil, nil, nil
+	}
+
+	originalPath := ctx.Path
+	pathOnly, queryValues, _ := splitPathAndQuery(originalPath)
+	basePrefix, relativePath := splitBasePath(ctx.APIContext, pathOnly)
+	updatedRelativePath := relativePath
+	pathRewriteApplied := false
+	queryRewriteConfigured := cfg.QueryRewrite != nil
+	isFullPathReplacement := false
+
+	if cfg.PathRewrite != nil {
+		rewriteType := strings.ToUpper(strings.TrimSpace(cfg.PathRewrite.Type))
+		if rewriteType == pathReplaceFull {
+			// ReplaceFullPath replaces the ENTIRE path, not just the relative portion.
+			isFullPathReplacement = true
+			if cfg.PathRewrite.ReplaceFullPath != "" {
+				updatedRelativePath = cfg.PathRewrite.ReplaceFullPath
+				pathRewriteApplied = true
+			}
+		} else {
+			updatedRelativePath = applyPathRewrite(ctx.OperationPath, updatedRelativePath, cfg.PathRewrite)
+			pathRewriteApplied = updatedRelativePath != relativePath
+		}
+	}
+
+	if cfg.QueryRewrite != nil {
+		if qErr := applyQueryRewrite(queryValues, cfg.QueryRewrite); qErr != nil {
+			return nil, nil, fmt.Errorf("invalid queryRewrite configuration: %w", qErr)
+		}
+	}
+
+	finalPath := originalPath
+	if pathRewriteApplied || queryRewriteConfigured {
+		var updatedPath string
+		if isFullPathReplacement {
+			updatedPath = updatedRelativePath
+		} else {
+			updatedPath = joinBaseAndRelative(basePrefix, updatedRelativePath)
+		}
+		finalPath = buildPath(updatedPath, queryValues)
+	}
+
+	if finalPath != originalPath {
+		slog.Info("[Request Rewrite]: Scheduling path rewrite", "from", originalPath, "to", finalPath)
+		newPath = &finalPath
+	}
+
+	method := strings.TrimSpace(cfg.MethodRewrite)
+	if method != "" {
+		method = strings.ToUpper(method)
+		if !isAllowedMethod(method) {
+			return nil, nil, fmt.Errorf("invalid methodRewrite value: unsupported method: %s", method)
+		}
+		slog.Info("[Request Rewrite]: Scheduling method rewrite", "method", method)
+		newMethod = &method
+	}
+
+	return newPath, newMethod, nil
+}
+
+func matchesRequestV2(ctx *policyv1alpha2.RequestHeaderContext, match *matchConfig) bool {
+	if match == nil {
+		return true
+	}
+
+	if len(match.Headers) == 0 && len(match.QueryParams) == 0 {
+		return true
+	}
+
+	for _, matcher := range match.Headers {
+		if !matchHeaderV2(ctx, matcher) {
+			return false
+		}
+	}
+
+	if len(match.QueryParams) > 0 {
+		_, queryValues, _ := splitPathAndQuery(ctx.Path)
+		for _, matcher := range match.QueryParams {
+			if !matchQueryParam(queryValues, matcher) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func matchHeaderV2(ctx *policyv1alpha2.RequestHeaderContext, matcher headerMatcher) bool {
+	name := strings.TrimSpace(matcher.Name)
+	if name == "" {
+		return false
+	}
+
+	matchType := strings.ToUpper(strings.TrimSpace(matcher.Type))
+	values := ctx.Headers.Get(name)
+
+	switch matchType {
+	case matchTypePresent:
+		return len(values) > 0
+	case matchTypeExact:
+		for _, v := range values {
+			if v == matcher.Value {
+				return true
+			}
+		}
+		return false
+	case matchTypeRegex:
+		regex, err := regexp.Compile(matcher.Value)
+		if err != nil {
+			slog.Warn("[Request Rewrite]: Invalid header regex", "name", name, "pattern", matcher.Value, "error", err)
+			return false
+		}
+		for _, v := range values {
+			if regex.MatchString(v) {
+				return true
+			}
+		}
+		return false
+	default:
+		slog.Warn("[Request Rewrite]: Unsupported header match type", "type", matcher.Type)
 		return false
 	}
 }

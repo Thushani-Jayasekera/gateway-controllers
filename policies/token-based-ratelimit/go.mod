@@ -1,9 +1,10 @@
 module github.com/wso2/gateway-controllers/policies/token-based-ratelimit
 
-go 1.25.1
+go 1.25.7
 
 require (
 	github.com/wso2/api-platform/sdk v0.3.8
+	github.com/wso2/api-platform/sdk/core v0.1.0
 	github.com/wso2/gateway-controllers/policies/advanced-ratelimit v0.3.2
 	golang.org/x/sync v0.19.0
 )

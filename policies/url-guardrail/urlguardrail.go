@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	utils "github.com/wso2/api-platform/sdk/utils"
 )
@@ -42,11 +43,22 @@ const (
 	DefaultResponseJSONPath      = "$.choices[0].message.content"
 	RequestFlowEnabledByDefault  = false
 	ResponseFlowEnabledByDefault = true
+
+	sseDataPrefix            = "data: "
+	sseDone                  = "[DONE]"
+	DefaultStreamingJsonPath = "$.choices[*].delta.content"
+	metaKeyAccJsonBody       = "urlguardrail:json_body"
 )
 
 var (
 	textCleanRegexCompiled = regexp.MustCompile(TextCleanRegex)
 	urlRegexCompiled       = regexp.MustCompile(URLRegex)
+	// incompleteURLAtEnd matches any incomplete URL at the end of the accumulated
+	// content — from a bare protocol token ("https", "http:", "https:/") all the
+	// way through a URL body that has started past "://" but has no terminating
+	// whitespace yet ("https://example.com/path"). A single regex covers both
+	// cases: https?  optionally followed by  :  and any non-whitespace chars.
+	incompleteURLAtEnd = regexp.MustCompile(`(?:^|[\s])https?(?::[^\s]*)?$`)
 )
 
 // URLGuardrailPolicy implements URL validation guardrail
@@ -58,13 +70,18 @@ type URLGuardrailPolicy struct {
 }
 
 type URLGuardrailPolicyParams struct {
-	Enabled        bool
-	JsonPath       string
-	OnlyDNS        bool
-	Timeout        int
-	ShowAssessment bool
+	Enabled           bool
+	JsonPath          string
+	StreamingJsonPath string
+	OnlyDNS           bool
+	Timeout           int
+	ShowAssessment    bool
 }
 
+// GetPolicy is the v1alpha factory entry point (loaded by v1alpha kernels).
+// The returned concrete type also satisfies policyv1alpha2 phase interfaces
+// (StreamingResponsePolicy, RequestPolicy, ResponsePolicy), so v1alpha2 kernels
+// can discover those capabilities via type assertions even when using this factory.
 func GetPolicy(
 	metadata policy.PolicyMetadata,
 	params map[string]interface{},
@@ -107,6 +124,20 @@ func GetPolicy(
 	return p, nil
 }
 
+// GetPolicyV2 is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
+func GetPolicyV2(
+	metadata policyv1alpha2.PolicyMetadata,
+	params map[string]interface{},
+) (policyv1alpha2.Policy, error) {
+	return GetPolicy(policy.PolicyMetadata{
+		RouteName:  metadata.RouteName,
+		APIId:      metadata.APIId,
+		APIName:    metadata.APIName,
+		APIVersion: metadata.APIVersion,
+		AttachedTo: policy.Level(metadata.AttachedTo),
+	}, params)
+}
+
 func getFlowParams(params map[string]interface{}, flow string) (map[string]interface{}, bool, error) {
 	raw, exists := params[flow]
 	if !exists {
@@ -122,8 +153,9 @@ func getFlowParams(params map[string]interface{}, flow string) (map[string]inter
 // parseParams parses and validates parameters from map to struct
 func parseParams(params map[string]interface{}, defaultJSONPath string, defaultEnabled bool) (URLGuardrailPolicyParams, error) {
 	result := URLGuardrailPolicyParams{
-		JsonPath: defaultJSONPath,
-		Enabled:  defaultEnabled,
+		JsonPath:          defaultJSONPath,
+		StreamingJsonPath: DefaultStreamingJsonPath,
+		Enabled:           defaultEnabled,
 	}
 
 	// Extract optional enabled parameter
@@ -141,6 +173,15 @@ func parseParams(params map[string]interface{}, defaultJSONPath string, defaultE
 			result.JsonPath = jsonPath
 		} else {
 			return result, fmt.Errorf("'jsonPath' must be a string")
+		}
+	}
+
+	// Extract optional streamingJsonPath parameter
+	if streamingJsonPathRaw, ok := params["streamingJsonPath"]; ok {
+		if streamingJsonPath, ok := streamingJsonPathRaw.(string); ok {
+			result.StreamingJsonPath = streamingJsonPath
+		} else {
+			return result, fmt.Errorf("'streamingJsonPath' must be a string")
 		}
 	}
 
@@ -204,7 +245,7 @@ func (p *URLGuardrailPolicy) Mode() policy.ProcessingMode {
 		RequestHeaderMode:  policy.HeaderModeSkip,
 		RequestBodyMode:    policy.BodyModeBuffer,
 		ResponseHeaderMode: policy.HeaderModeSkip,
-		ResponseBodyMode:   policy.BodyModeBuffer,
+		ResponseBodyMode:   policy.BodyModeStream,
 	}
 }
 
@@ -243,12 +284,17 @@ func (p *URLGuardrailPolicy) validatePayload(payload []byte, params URLGuardrail
 		return p.buildErrorResponse("Error extracting value from JSONPath", err, isResponse, params.ShowAssessment, []string{})
 	}
 
-	// Clean and trim
-	extractedValue = textCleanRegexCompiled.ReplaceAllString(extractedValue, "")
-	extractedValue = strings.TrimSpace(extractedValue)
+	return p.validateURLsInText(extractedValue, params, isResponse)
+}
+
+// validateURLsInText cleans text, finds URLs, validates each one, and returns
+// the appropriate action. Used by both the JSONPath path and the SSE path.
+func (p *URLGuardrailPolicy) validateURLsInText(text string, params URLGuardrailPolicyParams, isResponse bool) interface{} {
+	text = textCleanRegexCompiled.ReplaceAllString(text, "")
+	text = strings.TrimSpace(text)
 
 	// Extract URLs from the value
-	urls := urlRegexCompiled.FindAllString(extractedValue, -1)
+	urls := urlRegexCompiled.FindAllString(text, -1)
 	if len(urls) > 0 {
 		slog.Debug("URLGuardrail: Found URLs to validate", "urlCount", len(urls), "onlyDNS", params.OnlyDNS, "isResponse", isResponse)
 	}
@@ -468,4 +514,316 @@ func (p *URLGuardrailPolicy) buildAssessmentObject(reason string, validationErro
 	}
 
 	return assessment
+}
+
+// OnRequestBody validates URLs found in the request body.
+func (p *URLGuardrailPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, _ map[string]interface{}) policyv1alpha2.RequestAction {
+	if !p.hasRequestParams || !p.requestParams.Enabled {
+		return policyv1alpha2.UpstreamRequestModifications{}
+	}
+
+	var content []byte
+	if ctx.Body != nil {
+		content = ctx.Body.Content
+	}
+	return p.validatePayloadV2(content, p.requestParams, false).(policyv1alpha2.RequestAction)
+}
+
+// OnResponseBody validates URLs found in the response body.
+// For buffered SSE responses (stream:true with full body accumulated), the
+// delta content is extracted first; JSONPath extraction is only used for
+// plain JSON responses.
+func (p *URLGuardrailPolicy) OnResponseBody(ctx *policyv1alpha2.ResponseContext, _ map[string]interface{}) policyv1alpha2.ResponseAction {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	var content []byte
+	if ctx.ResponseBody != nil {
+		content = ctx.ResponseBody.Content
+	}
+
+	if text := extractSSEDeltaContent(string(content), p.responseParams.StreamingJsonPath); text != "" {
+		return p.validateURLsInTextV2(text, p.responseParams, true).(policyv1alpha2.ResponseAction)
+	}
+
+	return p.validatePayloadV2(content, p.responseParams, true).(policyv1alpha2.ResponseAction)
+}
+
+// ─── Streaming (SSE) support ──────────────────────────────────────────────────
+//
+// LLM responses with stream: true arrive as SSE events. Headers (and status)
+// are committed before any chunk reaches the policy, so ImmediateResponse
+// cannot be used here. If an invalid URL is found the offending chunk is
+// replaced with an SSE error event so the downstream client knows the guardrail
+// intervened.
+//
+// Non-SSE streaming bodies are passed through — the buffered OnResponseBody
+// already handles them when the kernel falls back to full buffering.
+
+// NeedsMoreResponseData controls how SSE chunks are accumulated before
+// OnResponseBodyChunk is called. The goal is to ensure a URL is never
+// validated while it is still being streamed token-by-token.
+//
+// Decision logic (evaluated in order):
+//
+//  1. Policy disabled → false (pass every chunk through immediately).
+//
+//  2. data: [DONE] present → false (stream is over; process whatever is
+//     accumulated, even if a URL looks incomplete at the very end).
+//
+//  3. No SSE delta content extracted → false (non-SSE body; the buffered
+//     OnResponseBody will handle it when the kernel falls back to full
+//     buffering, so there is nothing for the streaming path to do here).
+//
+//  4. Accumulated delta content ends with an incomplete URL — anything from
+//     a bare protocol token ("http", "https", "http:", "https:/") through a
+//     URL body that has started past "://" but has no terminating whitespace
+//     ("https://example.com/path") → true (keep accumulating; the rest of
+//     the URL is still arriving in subsequent tokens).
+//
+//  5. Otherwise → false (all URLs in the current window are complete and
+//     safe to validate).
+func (p *URLGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return false
+	}
+
+	s := string(accumulated)
+
+	if strings.Contains(s, sseDataPrefix+sseDone) {
+		return false
+	}
+
+	content := extractSSEDeltaContent(s, p.responseParams.StreamingJsonPath)
+	if content == "" {
+		return false
+	}
+
+	return incompleteURLAtEnd.MatchString(content)
+}
+
+// OnResponseBodyChunk validates URLs in SSE or plain JSON chunked responses.
+// For SSE: called once NeedsMoreResponseData returns false (URL complete or
+// stream done); on failure the chunk is replaced with an SSE error event.
+// For plain JSON (chunked transfer): chunks are accumulated until EndOfStream,
+// then validated via JSONPath; on failure the final chunk is replaced with a
+// JSON error body. ImmediateResponse is not available once headers are committed.
+func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx *policyv1alpha2.ResponseStreamContext, chunk *policyv1alpha2.StreamBody, _ map[string]interface{}) policyv1alpha2.ResponseChunkAction {
+	if !p.hasResponseParams || !p.responseParams.Enabled {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+	if chunk == nil || len(chunk.Chunk) == 0 {
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+
+	chunkStr := string(chunk.Chunk)
+
+	if !isSSEChunk(chunkStr) {
+		// Plain JSON via chunked transfer (e.g. OpenAI stream:false with Transfer-Encoding: chunked).
+		// Accumulate all chunks and validate the complete body at end of stream.
+		prev, _ := ctx.Metadata[metaKeyAccJsonBody].(string)
+		full := prev + chunkStr
+		ctx.Metadata[metaKeyAccJsonBody] = full
+		if !chunk.EndOfStream {
+			return policyv1alpha2.ResponseChunkAction{}
+		}
+		result := p.validatePayloadV2([]byte(full), p.responseParams, true)
+		if mod, ok := result.(policyv1alpha2.DownstreamResponseModifications); ok && mod.StatusCode != nil {
+			return policyv1alpha2.ResponseChunkAction{Body: mod.Body}
+		}
+		return policyv1alpha2.ResponseChunkAction{}
+	}
+
+	content := extractSSEDeltaContent(chunkStr, p.responseParams.StreamingJsonPath)
+	content = textCleanRegexCompiled.ReplaceAllString(content, "")
+	content = strings.TrimSpace(content)
+
+	urls := urlRegexCompiled.FindAllString(content, -1)
+	if len(urls) == 0 {
+		return policyv1alpha2.ResponseChunkAction{} // no URLs — pass through
+	}
+
+	invalidURLs := make([]string, 0)
+	for _, urlStr := range urls {
+		var isValid bool
+		if p.responseParams.OnlyDNS {
+			isValid = p.checkDNS(urlStr, p.responseParams.Timeout)
+		} else {
+			isValid = p.checkURL(urlStr, p.responseParams.Timeout)
+		}
+		if !isValid {
+			invalidURLs = append(invalidURLs, urlStr)
+		}
+	}
+
+	if len(invalidURLs) > 0 {
+		slog.Debug("URLGuardrail: streaming validation failed",
+			"invalidURLCount", len(invalidURLs), "totalURLCount", len(urls))
+		return policyv1alpha2.ResponseChunkAction{
+			Body: p.buildSSEErrorEvent(invalidURLs, p.responseParams.ShowAssessment),
+		}
+	}
+
+	return policyv1alpha2.ResponseChunkAction{} // all URLs valid — pass through
+}
+
+// isSSEChunk reports whether s contains at least one "data: " SSE line.
+func isSSEChunk(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractSSEDeltaContent extracts and concatenates content values from every
+// complete SSE data line in s using the provided streamingJsonPath.
+// Returns "" for non-SSE content or when no content is found.
+func extractSSEDeltaContent(s string, streamingJsonPath string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		if jsonStr == sseDone {
+			continue
+		}
+		if text, err := utils.ExtractStringValueFromJsonpath([]byte(jsonStr), streamingJsonPath); err == nil {
+			sb.WriteString(text)
+			continue
+		}
+		var jsonData map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &jsonData); err != nil {
+			continue
+		}
+		val, err := utils.ExtractValueFromJsonpath(jsonData, streamingJsonPath)
+		if err != nil {
+			continue
+		}
+		sb.WriteString(joinSSEFragments(val))
+	}
+	return sb.String()
+}
+
+// joinSSEFragments converts an extracted JSONPath value to a string.
+// Array elements are concatenated without a separator because SSE delta
+// fragments must be joined as-is without artificial whitespace.
+func joinSSEFragments(value interface{}) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var sb strings.Builder
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				sb.WriteString(s)
+			}
+		}
+		return sb.String()
+	default:
+		return ""
+	}
+}
+
+// buildSSEErrorEvent formats a guardrail intervention as a single SSE data
+// event, replacing the offending chunk in the stream.
+func (p *URLGuardrailPolicy) buildSSEErrorEvent(invalidURLs []string, showAssessment bool) []byte {
+	assessment := p.buildAssessmentObject("Violation of url validity detected", nil, true, showAssessment, invalidURLs)
+	responseBody := map[string]interface{}{
+		"type":    "URL_GUARDRAIL",
+		"message": assessment,
+	}
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(`{"type":"URL_GUARDRAIL","message":"Internal error"}`)
+	}
+	return []byte(sseDataPrefix + string(bodyBytes) + "\n\n")
+}
+
+func (p *URLGuardrailPolicy) validatePayloadV2(payload []byte, params URLGuardrailPolicyParams, isResponse bool) interface{} {
+	// Extract value using JSONPath
+	extractedValue, err := extractStringFromJSONPath(payload, params.JsonPath)
+	if err != nil {
+		slog.Debug("URLGuardrail: Error extracting value from JSONPath", "jsonPath", params.JsonPath, "error", err, "isResponse", isResponse)
+		return p.buildErrorResponseV2("Error extracting value from JSONPath", err, isResponse, params.ShowAssessment, []string{})
+	}
+
+	return p.validateURLsInTextV2(extractedValue, params, isResponse)
+}
+
+func (p *URLGuardrailPolicy) validateURLsInTextV2(text string, params URLGuardrailPolicyParams, isResponse bool) interface{} {
+	text = textCleanRegexCompiled.ReplaceAllString(text, "")
+	text = strings.TrimSpace(text)
+
+	// Extract URLs from the value
+	urls := urlRegexCompiled.FindAllString(text, -1)
+	if len(urls) > 0 {
+		slog.Debug("URLGuardrail: Found URLs to validate", "urlCount", len(urls), "onlyDNS", params.OnlyDNS, "isResponse", isResponse)
+	}
+	invalidURLs := make([]string, 0)
+
+	for _, urlStr := range urls {
+		var isValid bool
+		if params.OnlyDNS {
+			isValid = p.checkDNS(urlStr, params.Timeout)
+		} else {
+			isValid = p.checkURL(urlStr, params.Timeout)
+		}
+
+		if !isValid {
+			invalidURLs = append(invalidURLs, urlStr)
+		}
+	}
+
+	if len(invalidURLs) > 0 {
+		slog.Debug("URLGuardrail: Validation failed", "invalidURLCount", len(invalidURLs), "totalURLCount", len(urls), "isResponse", isResponse)
+		return p.buildErrorResponseV2("Violation of url validity detected", nil, isResponse, params.ShowAssessment, invalidURLs)
+	}
+
+	if len(urls) > 0 {
+		slog.Debug("URLGuardrail: Validation passed", "urlCount", len(urls), "isResponse", isResponse)
+	}
+
+	if isResponse {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+	return policyv1alpha2.UpstreamRequestModifications{}
+}
+
+// buildErrorResponseV2 builds a policyv1alpha2 error response for both request and response phases.
+func (p *URLGuardrailPolicy) buildErrorResponseV2(reason string, validationError error, isResponse bool, showAssessment bool, invalidURLs []string) interface{} {
+	assessment := p.buildAssessmentObject(reason, validationError, isResponse, showAssessment, invalidURLs)
+
+	responseBody := map[string]interface{}{
+		"type":    "URL_GUARDRAIL",
+		"message": assessment,
+	}
+
+	bodyBytes, err := json.Marshal(responseBody)
+	if err != nil {
+		bodyBytes = []byte(`{"type":"URL_GUARDRAIL","message":"Internal error"}`)
+	}
+
+	if isResponse {
+		statusCode := GuardrailErrorCode
+		return policyv1alpha2.DownstreamResponseModifications{
+			StatusCode: &statusCode,
+			Body:       bodyBytes,
+			DownstreamResponseHeaderModifications: policyv1alpha2.DownstreamResponseHeaderModifications{
+				HeadersToSet: map[string]string{"Content-Type": "application/json"},
+			},
+		}
+	}
+
+	return policyv1alpha2.ImmediateResponse{
+		StatusCode: GuardrailErrorCode,
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+		Body: bodyBytes,
+	}
 }
