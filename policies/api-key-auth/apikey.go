@@ -418,13 +418,13 @@ func (p *APIKeyPolicy) authenticate(
 		"apiOperation", apiOperation, "operationMethod", operationMethod,
 		"keyLength", len(providedKey))
 
-	isValid, err := p.validateAPIKey(apiId, apiOperation, operationMethod, providedKey, issuer)
+	resolvedKey, err := p.resolveValidatedAPIKey(apiId, apiOperation, operationMethod, providedKey, issuer)
 	if err != nil {
 		slog.Debug("API Key Auth Policy: Validation error", "error", err)
 		return p.failAuthV2(shared, 401, "json", "Valid API key required",
 			"error validating API key")
 	}
-	if !isValid {
+	if resolvedKey == nil {
 		slog.Debug("API Key Auth Policy: Invalid API key")
 		return p.failAuthV2(shared, 401, "json", "Valid API key required", "invalid API key")
 	}
