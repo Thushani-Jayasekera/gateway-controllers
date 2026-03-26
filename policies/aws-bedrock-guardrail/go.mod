@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.13.0
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.10
 	github.com/wso2/api-platform/sdk v0.4.5
-	github.com/wso2/api-platform/sdk/core v0.1.0
+	github.com/wso2/api-platform/sdk/core v0.1.2
 )
 
 require (
