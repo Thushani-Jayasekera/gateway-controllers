@@ -1990,12 +1990,143 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx *policyv1alpha2.ResponseHeaderCo
 }
 
 // OnResponseBody processes response-phase cost extraction and emits rate limit headers.
+// This mirrors the logic in OnResponse (v1alpha) but uses v1alpha2 context types.
+// It must run AFTER any policy that populates response metadata used as cost sources
+// (e.g. llm-cost sets x-llm-cost in SharedContext.Metadata). The executor runs
+// response policies in reverse chain order, so policies appended after this one
+// run first — ensuring cost metadata is available when this method executes.
 func (p *RateLimitPolicy) OnResponseBody(
 	ctx *policyv1alpha2.ResponseContext,
 	_ map[string]interface{},
 ) policyv1alpha2.ResponseAction {
-	// TODO
-	return nil
+	// Retrieve stored keys for cost extraction (populated during request phase)
+	quotaKeysRaw, hasKeys := ctx.Metadata[rateLimitKeysKey]
+	quotaKeys := make(map[string]string)
+	if hasKeys {
+		if keys, ok := quotaKeysRaw.(map[string]string); ok {
+			quotaKeys = keys
+		}
+	}
+
+	// Retrieve stored results from request phase
+	resultsRaw, hasResults := ctx.Metadata[rateLimitResultKey]
+	var storedResults []quotaResult
+	if hasResults {
+		if results, ok := resultsRaw.([]quotaResult); ok {
+			storedResults = results
+		}
+	}
+
+	storedResultsMap := make(map[string]quotaResult)
+	for _, r := range storedResults {
+		storedResultsMap[r.QuotaName] = r
+	}
+
+	var allQuotaResults []quotaResult
+
+	for i := range p.quotas {
+		q := &p.quotas[i]
+		quotaName := q.Name
+		if quotaName == "" {
+			quotaName = fmt.Sprintf("quota-%d", i)
+		}
+
+		if q.CostExtractionEnabled && q.CostExtractor != nil && q.CostExtractor.HasResponsePhaseSources() {
+			key := quotaKeys[quotaName]
+			if key == "" {
+				slog.Warn("Rate limit key not found for cost extraction", "quota", quotaName)
+				continue
+			}
+
+			actualCost, extracted := q.CostExtractor.ExtractResponseCostV2(ctx)
+			if !extracted {
+				slog.Debug("Cost extraction failed, using default",
+					"key", key, "quota", quotaName, "defaultCost", actualCost)
+			}
+
+			if actualCost < 0 {
+				actualCost = 0
+			}
+
+			if actualCost == 0 {
+				if stored, ok := storedResultsMap[quotaName]; ok && stored.Result != nil {
+					allQuotaResults = append(allQuotaResults, stored)
+				} else {
+					available, err := q.Limiter.GetAvailable(context.Background(), key)
+					if err == nil {
+						duration := getDurationFromQuota(q)
+						allQuotaResults = append(allQuotaResults, quotaResult{
+							QuotaName: quotaName,
+							Result: &limiter.Result{
+								Allowed:   available > 0,
+								Limit:     getLimitFromQuota(q),
+								Remaining: available,
+								Reset:     time.Now().Add(duration),
+								Duration:  duration,
+							},
+							Key:      key,
+							Duration: duration,
+						})
+					}
+				}
+				continue
+			}
+
+			var (
+				result *limiter.Result
+				err    error
+			)
+			if tracker, ok := q.Limiter.(limiter.CostTracker); ok {
+				result, err = tracker.ConsumeN(context.Background(), key, int64(actualCost))
+			} else {
+				result, err = q.Limiter.ConsumeOrClampN(context.Background(), key, int64(actualCost))
+			}
+			if err != nil {
+				if p.backend == "redis" && p.redisFailOpen {
+					slog.Warn("Post-response rate limit check failed (fail-open)",
+						"error", err, "key", key, "cost", actualCost, "quota", quotaName)
+					continue
+				}
+				slog.Error("Post-response rate limit check failed (fail-closed)",
+					"error", err, "key", key, "cost", actualCost, "quota", quotaName)
+				continue
+			}
+
+			if result != nil && !result.Allowed {
+				slog.Warn("Rate limit exceeded post-response",
+					"key", key, "cost", actualCost, "limit", result.Limit,
+					"remaining", result.Remaining, "consumed", result.Consumed,
+					"overflow", result.Overflow, "quota", quotaName)
+			}
+
+			allQuotaResults = append(allQuotaResults, quotaResult{
+				QuotaName: quotaName,
+				Result:    result,
+				Key:       key,
+				Duration:  result.Duration,
+			})
+		} else {
+			// No response-phase cost extraction — use stored result from request phase
+			if stored, ok := storedResultsMap[quotaName]; ok && stored.Result != nil {
+				allQuotaResults = append(allQuotaResults, stored)
+			}
+		}
+	}
+
+	if len(allQuotaResults) == 0 {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	headers := p.buildMultiQuotaHeaders(allQuotaResults, false, "")
+	if len(headers) == 0 {
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+
+	return policyv1alpha2.DownstreamResponseModifications{
+		DownstreamResponseHeaderModifications: policyv1alpha2.DownstreamResponseHeaderModifications{
+			HeadersToSet: headers,
+		},
+	}
 }
 
 func (p *RateLimitPolicy) extractQuotaKeyV2(ctx *policyv1alpha2.RequestContext, q *QuotaRuntime) string {

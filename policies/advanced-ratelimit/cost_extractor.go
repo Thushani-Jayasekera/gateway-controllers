@@ -261,6 +261,102 @@ func (e *CostExtractor) ExtractResponseCost(ctx *policy.ResponseContext) (float6
 	return total, true
 }
 
+// ExtractResponseCostV2 extracts cost from response-phase sources for v1alpha2 contexts.
+// This mirrors ExtractResponseCost but accepts *policyv1alpha2.ResponseContext.
+func (e *CostExtractor) ExtractResponseCostV2(ctx *policyv1alpha2.ResponseContext) (float64, bool) {
+	if !e.config.Enabled {
+		slog.Debug("Cost extraction disabled, returning default", "default", e.config.Default)
+		return e.config.Default, false
+	}
+
+	slog.Debug("Extracting response cost (v2)",
+		"sourceCount", len(e.config.Sources),
+		"default", e.config.Default)
+
+	var total float64
+	var found bool
+
+	for _, source := range e.config.Sources {
+		if !isResponsePhaseSource(source.Type) {
+			slog.Debug("Skipping non-response phase source", "type", source.Type)
+			continue
+		}
+
+		val, ok := e.extractFromResponseSourceV2(ctx, source)
+		if ok {
+			found = true
+			total += val * source.Multiplier
+			slog.Debug("Response cost extracted from source (v2)",
+				"type", source.Type,
+				"key", source.Key,
+				"rawValue", val,
+				"multiplier", source.Multiplier,
+				"contribution", val*source.Multiplier)
+		} else {
+			slog.Debug("Failed to extract cost from source (v2)",
+				"type", source.Type,
+				"key", source.Key)
+		}
+	}
+
+	if !found {
+		slog.Debug("All response cost extraction sources failed (v2), using default",
+			"default", e.config.Default)
+		return e.config.Default, false
+	}
+
+	if total < 0 {
+		slog.Warn("Total cost from response sources is negative; clamping to zero", "cost", total)
+		total = 0
+	}
+
+	slog.Debug("Response cost extracted successfully (v2)", "totalCost", total)
+	return total, true
+}
+
+func (e *CostExtractor) extractFromResponseSourceV2(ctx *policyv1alpha2.ResponseContext, source CostSource) (float64, bool) {
+	switch source.Type {
+	case CostSourceResponseHeader:
+		return e.extractFromResponseHeaderV2(ctx, source.Key)
+	case CostSourceResponseMetadata:
+		return e.extractFromResponseMetadataV2(ctx, source.Key)
+	case CostSourceResponseBody:
+		return e.extractFromResponseBodyV2(ctx, source.JSONPath)
+	default:
+		// response_cel not yet implemented for v1alpha2
+		slog.Debug("Unsupported response cost source type for v1alpha2", "type", source.Type)
+		return 0, false
+	}
+}
+
+func (e *CostExtractor) extractFromResponseHeaderV2(ctx *policyv1alpha2.ResponseContext, headerName string) (float64, bool) {
+	if ctx.ResponseHeaders == nil {
+		return 0, false
+	}
+	values := ctx.ResponseHeaders.Get(strings.ToLower(headerName))
+	if len(values) == 0 || values[0] == "" {
+		return 0, false
+	}
+	cost, err := strconv.ParseFloat(values[0], 64)
+	if err != nil {
+		slog.Warn("Failed to parse cost from response header (v2)",
+			"header", headerName, "value", values[0], "error", err)
+		return 0, false
+	}
+	return cost, true
+}
+
+func (e *CostExtractor) extractFromResponseMetadataV2(ctx *policyv1alpha2.ResponseContext, key string) (float64, bool) {
+	return extractFromMetadataMap(ctx.Metadata, key)
+}
+
+func (e *CostExtractor) extractFromResponseBodyV2(ctx *policyv1alpha2.ResponseContext, jsonPath string) (float64, bool) {
+	if ctx.ResponseBody == nil || !ctx.ResponseBody.Present {
+		return 0, false
+	}
+	return extractFromBodyBytes(ctx.ResponseBody.Content, jsonPath)
+}
+
 // isRequestPhaseSource returns true if the source type is available during request phase
 func isRequestPhaseSource(t CostSourceType) bool {
 	switch t {
