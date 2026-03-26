@@ -200,7 +200,6 @@ func (p *McpAuthPolicy) OnRequest(ctx *policy.RequestContext, params map[string]
 		// Parse MCP request to extract method and name
 		var mcpReq MCPRequest
 		if err := json.Unmarshal(ctx.Body.Content, &mcpReq); err != nil {
-			slog.Debug("MCP Auth Policy: Body:", "content", string(ctx.Body.Content))
 			slog.Debug("MCP Auth Policy: Failed to parse MCP request", "error", err)
 			return p.handleAuthFailure(ctx, p.OnFailureStatusCode, p.ErrorMessageFormat, "Invalid MCP request format")
 		}
@@ -687,7 +686,6 @@ func (p *McpAuthPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, params
 		}
 		var mcpReq MCPRequest
 		if err := json.Unmarshal(ctx.Body.Content, &mcpReq); err != nil {
-			slog.Debug("MCP Auth Policy: Body:", "content", string(ctx.Body.Content))
 			slog.Debug("MCP Auth Policy: Failed to parse MCP request", "error", err)
 			return p.handleAuthFailureV2(ctx.SharedContext, p.OnFailureStatusCode, p.ErrorMessageFormat, "Invalid MCP request format")
 		}

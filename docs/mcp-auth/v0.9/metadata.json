@@ -1,7 +1,7 @@
 {
   "name": "mcp-auth",
   "displayName": "MCP Authentication",
-  "version": "0.10",
+  "version": "0.9",
   "provider": "WSO2",
   "categories": [
     "MCP",

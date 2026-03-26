@@ -40,7 +40,7 @@ Configured by the administrator in `config.toml` under `policy_configurations.mc
 | `errorMessageFormat` | string | No | `"json"` | jwtauth_v0 | Format of the error response. Allowed values: `"json"`, `"plain"`, `"minimal"`. |
 | `errorMessage` | string | No | - | jwtauth_v0 | Custom error message to include in the response body on authentication failure. |
 | `validateIssuer` | boolean | No | - | jwtauth_v0 | Whether to validate the token's issuer claim against configured key managers. |
-| `gatewayHost` | string | No | `"localhost"` | mcpauth_v0 | The outward facing gateway host name used when deriving the protected resource metadata URL and response. |
+| `gatewayHost` | string | No | `"localhost"` | mcpauth_v0 | The outward-facing gateway host name used when deriving the protected resource metadata URL and response. |
 
 #### KeyManager Configuration
 
