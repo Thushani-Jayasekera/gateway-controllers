@@ -1457,8 +1457,10 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx *policy.ResponseHeaderContext, p
 			quotaName = fmt.Sprintf("quota-%d", i)
 		}
 
-		// Handle post-response cost extraction for quotas that have it enabled
-		if q.CostExtractionEnabled && q.CostExtractor != nil && q.CostExtractor.HasResponsePhaseSources() {
+		// Handle post-response cost extraction for quotas that have it enabled.
+		// Skip quotas that require the response body — those are handled exclusively
+		// in OnResponseBody to avoid double consumption.
+		if q.CostExtractionEnabled && q.CostExtractor != nil && q.CostExtractor.HasResponsePhaseSources() && !q.CostExtractor.RequiresResponseBody() {
 			slog.Debug("Processing response-phase cost extraction",
 				"quota", quotaName)
 
