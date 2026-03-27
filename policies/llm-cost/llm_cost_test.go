@@ -2152,8 +2152,10 @@ func TestMergeSSEEvents_OpenAI(t *testing.T) {
 }
 
 func TestMergeSSEEvents_Anthropic(t *testing.T) {
-	// Anthropic sends usage across two events: message_start has input_tokens,
-	// message_delta has output_tokens.
+	// Anthropic sends usage across two events: message_start has input_tokens
+	// inside a "message" envelope, message_delta has output_tokens at top level.
+	// mergeSSEEvents does a generic merge — provider-specific handling (e.g.
+	// hoisting message.usage) is the calculator's responsibility.
 	sseBody := []byte(
 		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":25,\"output_tokens\":0}}}\n" +
 			"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n" +
@@ -2169,17 +2171,18 @@ func TestMergeSSEEvents_Anthropic(t *testing.T) {
 	if err := json.Unmarshal(merged, &result); err != nil {
 		t.Fatalf("merged output is not valid JSON: %v", err)
 	}
-	// model should be hoisted from message.model
-	if result["model"] != "claude-sonnet-4-20250514" {
-		t.Errorf("expected model=claude-sonnet-4-20250514, got %v", result["model"])
+	// message envelope should be preserved as-is (model lives inside it)
+	msg, ok := result["message"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected message map in merged output")
 	}
-	// usage should be deep-merged: input_tokens from message_start + output_tokens from message_delta
+	if msg["model"] != "claude-sonnet-4-20250514" {
+		t.Errorf("expected message.model=claude-sonnet-4-20250514, got %v", msg["model"])
+	}
+	// top-level usage should contain output_tokens from message_delta
 	usage, ok := result["usage"].(map[string]interface{})
 	if !ok {
 		t.Fatal("expected usage map in merged output")
-	}
-	if usage["input_tokens"].(float64) != 25 {
-		t.Errorf("expected input_tokens=25, got %v", usage["input_tokens"])
 	}
 	if usage["output_tokens"].(float64) != 15 {
 		t.Errorf("expected output_tokens=15, got %v", usage["output_tokens"])

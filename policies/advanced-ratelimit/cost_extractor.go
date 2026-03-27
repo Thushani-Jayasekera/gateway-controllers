@@ -370,8 +370,9 @@ func extractFromMetadataMap(metadata map[string]interface{}, key string) (float6
 }
 
 const (
-	sseDataPrefix = "data: "
-	sseDone       = "[DONE]"
+	sseDataPrefix  = "data: "
+	sseDone        = "[DONE]"
+	sseEventPrefix = "event:"
 )
 
 // extractFromBodyBytes is a helper to extract cost from body bytes using JSONPath.
@@ -414,16 +415,20 @@ func extractFromSSEBodyBytes(bodyBytes []byte, jsonPath string) (float64, bool) 
 	var found bool
 
 	for _, line := range strings.Split(string(bodyBytes), "\n") {
-		if !strings.HasPrefix(line, sseDataPrefix) {
+		line = strings.TrimRight(line, "\r")
+		var value string
+		if strings.HasPrefix(line, sseDataPrefix) {
+			value = strings.TrimPrefix(line, sseDataPrefix)
+		} else if strings.HasPrefix(line, sseEventPrefix) {
+			value = strings.TrimSpace(strings.TrimPrefix(line, sseEventPrefix))
+		} else {
 			continue
 		}
-		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
-		jsonStr = strings.TrimSpace(jsonStr)
-		if jsonStr == sseDone || jsonStr == "" {
+		if value == sseDone || value == "" {
 			continue
 		}
 
-		valueStr, err := utils.ExtractStringValueFromJsonpath([]byte(jsonStr), jsonPath)
+		valueStr, err := utils.ExtractStringValueFromJsonpath([]byte(value), jsonPath)
 		if err != nil {
 			continue
 		}

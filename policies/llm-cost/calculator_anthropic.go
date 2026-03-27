@@ -27,28 +27,40 @@ import (
 type AnthropicCalculator struct{}
 
 func (c *AnthropicCalculator) Normalize(responseBody []byte, requestBody []byte) (Usage, error) {
+	// anthropicUsage holds the token fields from Anthropic's usage object.
+	type anthropicUsage struct {
+		InputTokens              int64  `json:"input_tokens"`
+		OutputTokens             int64  `json:"output_tokens"`
+		CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int64  `json:"cache_read_input_tokens"`
+		InferenceGeo             string `json:"inference_geo"`
+		CacheCreation *struct {
+			Ephemeral5mInputTokens int64 `json:"ephemeral_5m_input_tokens"`
+			Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
+		} `json:"cache_creation"`
+		ServerToolUse *struct {
+			WebSearchRequests int64 `json:"web_search_requests"`
+		} `json:"server_tool_use"`
+	}
 	var resp struct {
-		Usage struct {
-			InputTokens              int64  `json:"input_tokens"`
-			OutputTokens             int64  `json:"output_tokens"`
-			CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"`
-			CacheReadInputTokens     int64  `json:"cache_read_input_tokens"`
-			InferenceGeo             string `json:"inference_geo"`
-			// Anthropic echoes the per-TTL breakdown of cache writes when the caller
-			// used mixed TTLs. When present, these two fields sum to CacheCreationInputTokens.
-			CacheCreation *struct {
-				Ephemeral5mInputTokens int64 `json:"ephemeral_5m_input_tokens"`
-				Ephemeral1hInputTokens int64 `json:"ephemeral_1h_input_tokens"`
-			} `json:"cache_creation"`
-			// Built-in server tools (web search, tool search).
-			// web_search_requests is the count of web search queries made during the call.
-			ServerToolUse *struct {
-				WebSearchRequests int64 `json:"web_search_requests"`
-			} `json:"server_tool_use"`
-		} `json:"usage"`
+		Model   string        `json:"model"`
+		Usage   anthropicUsage `json:"usage"`
+		// Anthropic streaming wraps usage/model inside a "message" envelope
+		// in the message_start event. Check both locations.
+		Message *struct {
+			Model string        `json:"model"`
+			Usage anthropicUsage `json:"usage"`
+		} `json:"message"`
 	}
 	if err := json.Unmarshal(responseBody, &resp); err != nil {
 		return Usage{}, err
+	}
+
+	// If usage is empty at top level but present inside message envelope, use that.
+	if resp.Usage.InputTokens == 0 && resp.Usage.OutputTokens == 0 && resp.Message != nil {
+		if resp.Message.Usage.InputTokens > 0 || resp.Message.Usage.OutputTokens > 0 {
+			resp.Usage = resp.Message.Usage
+		}
 	}
 
 	// speed and web_search_options are request-side parameters Anthropic does not echo.

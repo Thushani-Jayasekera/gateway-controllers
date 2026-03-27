@@ -44,8 +44,9 @@ const (
 	DefaultSSNRegex           = `(?:00[1-9]|0[1-9][0-9]|[1-5][0-9]{2}|6(?:[0-57-9][0-9]|6[0-57-9])|[7-8][0-9]{2})[- ]?(?:0[1-9]|[1-9][0-9])[- ]?(?:000[1-9]|00[1-9][0-9]|0[1-9][0-9]{2}|[1-9][0-9]{3})\b`
 
 	// SSE constants for streaming responses
-	sseDataPrefix = "data: "
-	sseDone       = "[DONE]"
+	sseDataPrefix  = "data: "
+	sseDone        = "[DONE]"
+	sseEventPrefix = "event:"
 )
 
 var textCleanRegexCompiled = regexp.MustCompile(TextCleanRegex)
@@ -547,10 +548,10 @@ func (p *PIIMaskingRegexPolicy) OnResponseBodyChunk(ctx *policy.ResponseStreamCo
 
 // ─── SSE / Streaming helpers ─────────────────────────────────────────────────
 
-// isSSEChunk reports whether the chunk looks like SSE data (has at least one "data: " line).
+// isSSEChunk reports whether the chunk looks like SSE data (has at least one "data: " or "event:" line).
 func isSSEChunk(s string) bool {
 	for _, line := range strings.SplitN(s, "\n", 5) {
-		if strings.HasPrefix(line, sseDataPrefix) {
+		if strings.HasPrefix(line, sseDataPrefix) || strings.HasPrefix(line, sseEventPrefix) {
 			return true
 		}
 	}
@@ -788,25 +789,34 @@ func extractSSEDeltaContentTracked(s string) (string, int, int) {
 	lastOpenBracketDataLine := 0
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if !strings.HasPrefix(line, sseDataPrefix) {
+		var value string
+		if strings.HasPrefix(line, sseDataPrefix) {
+			value = strings.TrimPrefix(line, sseDataPrefix)
+		} else if strings.HasPrefix(line, sseEventPrefix) {
+			value = strings.TrimSpace(strings.TrimPrefix(line, sseEventPrefix))
+		} else {
 			continue
 		}
-		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
-		if jsonStr == sseDone {
+		if value == sseDone {
 			totalDataLines++
 			continue
 		}
-		var data map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
-			continue // incomplete / partial line — skip
+		if value == "" {
+			continue
 		}
+		var data map[string]interface{}
 		lineContent := ""
-		choices, _ := data["choices"].([]interface{})
-		for _, cr := range choices {
-			choice, _ := cr.(map[string]interface{})
-			delta, _ := choice["delta"].(map[string]interface{})
-			content, _ := delta["content"].(string)
-			lineContent += content
+		if err := json.Unmarshal([]byte(value), &data); err != nil {
+			// Not JSON — use the entire value as content
+			lineContent = value
+		} else {
+			choices, _ := data["choices"].([]interface{})
+			for _, cr := range choices {
+				choice, _ := cr.(map[string]interface{})
+				delta, _ := choice["delta"].(map[string]interface{})
+				content, _ := delta["content"].(string)
+				lineContent += content
+			}
 		}
 		if strings.Contains(lineContent, "[") {
 			lastOpenBracketDataLine = totalDataLines

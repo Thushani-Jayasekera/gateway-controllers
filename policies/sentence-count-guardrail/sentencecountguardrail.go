@@ -40,6 +40,7 @@ const (
 
 	sseDataPrefix            = "data: "
 	sseDone                  = "[DONE]"
+	sseEventPrefix           = "event:"
 	metaKeyAccContent        = "sentencecountguardrail:accumulated_content"
 	metaKeyAccJsonBody       = "sentencecountguardrail:json_body"
 	DefaultStreamingJsonPath = "$.choices[0].delta.content"
@@ -661,10 +662,10 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx *policy.ResponseS
 	return policy.ResponseChunkAction{}
 }
 
-// isSSEChunk reports whether s contains at least one "data: " SSE line.
+// isSSEChunk reports whether s looks like SSE data (has at least one "data: " or "event:" line).
 func isSSEChunk(s string) bool {
 	for _, line := range strings.SplitN(s, "\n", 5) {
-		if strings.HasPrefix(line, sseDataPrefix) {
+		if strings.HasPrefix(line, sseDataPrefix) || strings.HasPrefix(line, sseEventPrefix) {
 			return true
 		}
 	}
@@ -678,23 +679,31 @@ func extractSSEDeltaContent(s string, streamingJsonPath string) string {
 	var sb strings.Builder
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimRight(line, "\r")
-		if !strings.HasPrefix(line, sseDataPrefix) {
+		var value string
+		if strings.HasPrefix(line, sseDataPrefix) {
+			value = strings.TrimPrefix(line, sseDataPrefix)
+		} else if strings.HasPrefix(line, sseEventPrefix) {
+			value = strings.TrimSpace(strings.TrimPrefix(line, sseEventPrefix))
+		} else {
 			continue
 		}
-		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
-		if jsonStr == sseDone {
+		if value == sseDone || value == "" {
 			continue
 		}
-		if text, err := utils.ExtractStringValueFromJsonpath([]byte(jsonStr), streamingJsonPath); err == nil {
+		// Try extracting from streamingJsonPath
+		if text, err := utils.ExtractStringValueFromJsonpath([]byte(value), streamingJsonPath); err == nil {
 			sb.WriteString(text)
 			continue
 		}
 		var jsonData map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonStr), &jsonData); err != nil {
+		if err := json.Unmarshal([]byte(value), &jsonData); err != nil {
+			// Not JSON — use the entire value as content
+			sb.WriteString(value)
 			continue
 		}
 		val, err := utils.ExtractValueFromJsonpath(jsonData, streamingJsonPath)
 		if err != nil {
+			sb.WriteString(value)
 			continue
 		}
 		sb.WriteString(joinSSEFragments(val))

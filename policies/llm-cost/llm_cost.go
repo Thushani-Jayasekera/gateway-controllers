@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	sseDataPrefix = "data: "
-	sseDone       = "[DONE]"
+	sseDataPrefix  = "data: "
+	sseDone        = "[DONE]"
+	sseEventPrefix = "event:"
 )
 
 const (
@@ -122,10 +123,16 @@ func (p *LLMCostPolicy) OnResponseBody(ctx *policy.ResponseContext, _ map[string
 	}
 
 	// Extract model name from response body.
-	// OpenAI-compatible providers use $.model; Gemini uses $.modelVersion.
+	// Providers place the model name in different locations:
+	//   $.model (OpenAI, Anthropic non-streaming, Mistral)
+	//   $.modelVersion (Gemini)
+	//   $.message.model (Anthropic streaming after SSE merge)
 	var probe struct {
 		Model        string `json:"model"`
 		ModelVersion string `json:"modelVersion"`
+		Message      *struct {
+			Model string `json:"model"`
+		} `json:"message"`
 	}
 	if err := json.Unmarshal(responseBody, &probe); err != nil {
 		slog.Warn("llm-cost: could not parse response body", "error", err)
@@ -135,8 +142,11 @@ func (p *LLMCostPolicy) OnResponseBody(ctx *policy.ResponseContext, _ map[string
 	if modelName == "" {
 		modelName = probe.ModelVersion
 	}
+	if modelName == "" && probe.Message != nil {
+		modelName = probe.Message.Model
+	}
 	if modelName == "" {
-		slog.Warn("llm-cost: no model name found in response body ($.model or $.modelVersion)")
+		slog.Warn("llm-cost: no model name found in response body")
 		return setCostMetadata(ctx, 0.0, costStatusNotCalculated)
 	}
 
@@ -188,57 +198,42 @@ func (p *LLMCostPolicy) OnResponseBody(ctx *policy.ResponseContext, _ map[string
 // least one "data: " line).
 func isSSEContent(b []byte) bool {
 	for _, line := range strings.Split(string(b), "\n") {
-		if strings.HasPrefix(line, sseDataPrefix) {
+		if strings.HasPrefix(line, sseDataPrefix) || strings.HasPrefix(line, sseEventPrefix) {
 			return true
 		}
 	}
 	return false
 }
 
-// mergeSSEEvents parses every SSE "data:" line as JSON and shallow-merges all
+// mergeSSEEvents parses every SSE data/event line as JSON and shallow-merges all
 // top-level keys into a single object (later events win). This produces a
 // JSON blob that contains the `model` from early events together with the
 // `usage` / `usageMetadata` from the final event, allowing existing
 // provider calculators to parse it unchanged.
-//
-// Anthropic streaming sends usage across two events:
-//   - message_start → message.usage.input_tokens
-//   - message_delta → usage.output_tokens
-//
-// The merge handles this by deep-merging the "usage" key: later values
-// override, but keys only present in earlier events are preserved.
+// The "usage" and "usageMetadata" keys are deep-merged so that fields
+// from earlier events (e.g. input_tokens) survive when a later event
+// only carries output_tokens.
 func mergeSSEEvents(body []byte) ([]byte, error) {
 	merged := make(map[string]interface{})
 
 	for _, line := range strings.Split(string(body), "\n") {
-		if !strings.HasPrefix(line, sseDataPrefix) {
+		line = strings.TrimRight(line, "\r")
+		var value string
+		if strings.HasPrefix(line, sseDataPrefix) {
+			value = strings.TrimPrefix(line, sseDataPrefix)
+		} else if strings.HasPrefix(line, sseEventPrefix) {
+			value = strings.TrimSpace(strings.TrimPrefix(line, sseEventPrefix))
+		} else {
 			continue
 		}
-		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
-		jsonStr = strings.TrimSpace(jsonStr)
-		if jsonStr == sseDone || jsonStr == "" {
+		value = strings.TrimSpace(value)
+		if value == sseDone || value == "" {
 			continue
 		}
 
 		var event map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonStr), &event); err != nil {
-			continue // skip malformed lines
-		}
-
-		// Anthropic wraps the initial usage inside a "message" envelope.
-		// Hoist message.usage → top-level usage and message.model → model
-		// so they participate in the merge with later message_delta events.
-		if msg, ok := event["message"].(map[string]interface{}); ok {
-			if mu, ok := msg["usage"].(map[string]interface{}); ok {
-				if _, exists := event["usage"]; !exists {
-					event["usage"] = mu
-				}
-			}
-			if model, ok := msg["model"].(string); ok {
-				if _, exists := event["model"]; !exists {
-					event["model"] = model
-				}
-			}
+		if err := json.Unmarshal([]byte(value), &event); err != nil {
+			continue // skip non-JSON lines
 		}
 
 		for k, v := range event {

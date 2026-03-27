@@ -36,6 +36,7 @@ import (
 const (
 	sseDataPrefix            = "data: "
 	sseDone                  = "[DONE]"
+	sseEventPrefix           = "event:"
 	DefaultStreamingJsonPath = "$.choices[0].delta.content"
 )
 
@@ -521,7 +522,7 @@ func isSSEResponse(headers *policy.Headers) bool {
 // isSSEContent reports whether the body content looks like buffered SSE data.
 func isSSEContent(s string) bool {
 	for _, line := range strings.Split(s, "\n") {
-		if strings.HasPrefix(line, sseDataPrefix) {
+		if strings.HasPrefix(line, sseDataPrefix) || strings.HasPrefix(line, sseEventPrefix) {
 			return true
 		}
 	}
@@ -538,23 +539,28 @@ func assembleSSEResponse(sseBody string, streamingJsonPath string) (map[string]i
 	var lastEvent map[string]interface{}
 
 	for _, line := range strings.Split(sseBody, "\n") {
-		if !strings.HasPrefix(line, sseDataPrefix) {
+		line = strings.TrimRight(line, "\r")
+		var value string
+		if strings.HasPrefix(line, sseDataPrefix) {
+			value = strings.TrimPrefix(line, sseDataPrefix)
+		} else if strings.HasPrefix(line, sseEventPrefix) {
+			value = strings.TrimSpace(strings.TrimPrefix(line, sseEventPrefix))
+		} else {
 			continue
 		}
-		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
-		jsonStr = strings.TrimSpace(jsonStr)
-		if jsonStr == sseDone || jsonStr == "" {
+		value = strings.TrimSpace(value)
+		if value == sseDone || value == "" {
 			continue
 		}
 
 		var event map[string]interface{}
-		if err := json.Unmarshal([]byte(jsonStr), &event); err != nil {
-			continue // skip malformed lines
+		if err := json.Unmarshal([]byte(value), &event); err != nil {
+			continue // skip non-JSON lines
 		}
 		lastEvent = event
 
 		// Extract content using the configurable streaming JSONPath
-		if text, err := utils.ExtractStringValueFromJsonpath([]byte(jsonStr), streamingJsonPath); err == nil && text != "" {
+		if text, err := utils.ExtractStringValueFromJsonpath([]byte(value), streamingJsonPath); err == nil && text != "" {
 			contentParts = append(contentParts, text)
 		}
 	}
