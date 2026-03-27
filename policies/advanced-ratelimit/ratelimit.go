@@ -941,6 +941,23 @@ func (p *RateLimitPolicy) requiresResponseBody() bool {
 	return false
 }
 
+// hasNonBodyResponsePhaseSources returns true if any quota has response-phase cost
+// sources that do not require the response body (e.g. response_metadata,
+// response_header). These sources cannot be resolved in OnResponseHeaders because
+// upstream policies that populate the metadata (e.g. llm-cost writing x-llm-cost)
+// run in the response-body phase. OnResponseBody must therefore also process them,
+// after those upstream policies have had a chance to set the metadata.
+func (p *RateLimitPolicy) hasNonBodyResponsePhaseSources() bool {
+	for _, q := range p.quotas {
+		if q.CostExtractionEnabled && q.CostExtractor != nil {
+			if q.CostExtractor.HasResponsePhaseSources() && !q.CostExtractor.RequiresResponseBody() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // getLimitFromQuota returns the limit from a quota's first limit config, or 0 if none
 func getLimitFromQuota(q *QuotaRuntime) int64 {
 	if len(q.Limits) > 0 {
@@ -1584,11 +1601,17 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx *policy.ResponseHeaderContext, p
 // (e.g. llm-cost sets x-llm-cost in SharedContext.Metadata). The executor runs
 // response policies in reverse chain order, so policies appended after this one
 // run first — ensuring cost metadata is available when this method executes.
+//
+// Note: this method also handles non-body response-phase sources (e.g.
+// response_metadata) even though they don't require the body bytes. Those sources
+// could not be resolved in OnResponseHeaders because the metadata they read
+// (e.g. x-llm-cost) is populated by upstream policies that run in the body phase.
+// By the time this method is called, those policies have already executed.
 func (p *RateLimitPolicy) OnResponseBody(
 	ctx *policy.ResponseContext,
 	_ map[string]interface{},
 ) policy.ResponseAction {
-	if p.requiresResponseBody() {
+	if p.requiresResponseBody() || p.hasNonBodyResponsePhaseSources() {
 		slog.Debug("Processing rate limit response phase",
 			"route", p.routeName,
 			"status", ctx.ResponseStatus,
