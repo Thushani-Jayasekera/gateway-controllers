@@ -1576,10 +1576,8 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx *policy.ResponseHeaderContext, p
 		return nil
 	}
 
-	return policy.DownstreamResponseModifications{
-		DownstreamResponseHeaderModifications: policy.DownstreamResponseHeaderModifications{
-			HeadersToSet: headers,
-		},
+	return policyv1alpha2.DownstreamResponseHeaderModifications{
+		HeadersToSet: headers,
 	}
 }
 
