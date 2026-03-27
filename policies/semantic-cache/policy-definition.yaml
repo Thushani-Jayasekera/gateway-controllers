@@ -23,6 +23,14 @@ parameters:
         Specifies the JSONPath used to extract text for embedding generation.
         When omitted, the entire request body is used.
       default: "$.messages[-1].content"
+    streamingJsonPath:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        Specifies the JSONPath used to extract content from each SSE streaming
+        delta event when caching streamed responses. Only needed if the upstream
+        uses a non-OpenAI-compatible streaming format.
+      default: "$.choices[0].delta.content"
   required:
   - similarityThreshold
 

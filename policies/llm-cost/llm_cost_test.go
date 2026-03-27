@@ -2106,3 +2106,118 @@ func TestLoadPricingFromFile_InvalidJSON(t *testing.T) {
 		t.Fatal("expected error for invalid JSON, got nil")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// SSE streaming response handling
+// ---------------------------------------------------------------------------
+
+func TestIsSSEContent(t *testing.T) {
+	if !isSSEContent([]byte("data: {\"foo\":1}\ndata: [DONE]\n")) {
+		t.Error("expected true for SSE content")
+	}
+	if isSSEContent([]byte(`{"foo":1}`)) {
+		t.Error("expected false for plain JSON")
+	}
+}
+
+func TestMergeSSEEvents_OpenAI(t *testing.T) {
+	sseBody := []byte(
+		"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini-2024-07-18\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n" +
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini-2024-07-18\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n" +
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini-2024-07-18\",\"service_tier\":\"default\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":62,\"total_tokens\":162,\"prompt_tokens_details\":{\"cached_tokens\":0,\"audio_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0,\"audio_tokens\":0}}}\n" +
+			"data: [DONE]\n",
+	)
+	merged, err := mergeSSEEvents(sseBody)
+	if err != nil {
+		t.Fatalf("mergeSSEEvents failed: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(merged, &result); err != nil {
+		t.Fatalf("merged output is not valid JSON: %v", err)
+	}
+	if result["model"] != "gpt-4o-mini-2024-07-18" {
+		t.Errorf("expected model=gpt-4o-mini-2024-07-18, got %v", result["model"])
+	}
+	usage, ok := result["usage"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected usage map in merged output")
+	}
+	if usage["prompt_tokens"].(float64) != 100 {
+		t.Errorf("expected prompt_tokens=100, got %v", usage["prompt_tokens"])
+	}
+	if usage["completion_tokens"].(float64) != 62 {
+		t.Errorf("expected completion_tokens=62, got %v", usage["completion_tokens"])
+	}
+}
+
+func TestMergeSSEEvents_Anthropic(t *testing.T) {
+	// Anthropic sends usage across two events: message_start has input_tokens,
+	// message_delta has output_tokens.
+	sseBody := []byte(
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-1\",\"model\":\"claude-sonnet-4-20250514\",\"usage\":{\"input_tokens\":25,\"output_tokens\":0}}}\n" +
+			"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n" +
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n" +
+			"data: {\"type\":\"message_stop\"}\n",
+	)
+	merged, err := mergeSSEEvents(sseBody)
+	if err != nil {
+		t.Fatalf("mergeSSEEvents failed: %v", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(merged, &result); err != nil {
+		t.Fatalf("merged output is not valid JSON: %v", err)
+	}
+	// model should be hoisted from message.model
+	if result["model"] != "claude-sonnet-4-20250514" {
+		t.Errorf("expected model=claude-sonnet-4-20250514, got %v", result["model"])
+	}
+	// usage should be deep-merged: input_tokens from message_start + output_tokens from message_delta
+	usage, ok := result["usage"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected usage map in merged output")
+	}
+	if usage["input_tokens"].(float64) != 25 {
+		t.Errorf("expected input_tokens=25, got %v", usage["input_tokens"])
+	}
+	if usage["output_tokens"].(float64) != 15 {
+		t.Errorf("expected output_tokens=15, got %v", usage["output_tokens"])
+	}
+}
+
+func TestMergeSSEEvents_NoValidEvents(t *testing.T) {
+	_, err := mergeSSEEvents([]byte("not sse data\njust some text\n"))
+	if err == nil {
+		t.Error("expected error for non-SSE content")
+	}
+}
+
+func TestOnResponseBody_SSE_OpenAI_Calculated(t *testing.T) {
+	p := &LLMCostPolicy{pricingMap: testPricingMap}
+	sseBody := []byte(
+		"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini-2024-07-18\",\"service_tier\":\"default\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]}\n" +
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini-2024-07-18\",\"service_tier\":\"default\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n" +
+			"data: [DONE]\n",
+	)
+	ctx := makeResponseContext(sseBody)
+	action := p.OnResponseBody(ctx, nil)
+	assertCostMetadata(t, ctx, action, costStatusCalculated, "")
+	if gotCost, _ := ctx.Metadata[MetadataLLMCost].(string); gotCost == "" {
+		t.Error("expected non-empty x-llm-cost for SSE OpenAI response")
+	}
+}
+
+func TestOnResponseBody_SSE_NoUsage_NotCalculated(t *testing.T) {
+	p := &LLMCostPolicy{pricingMap: testPricingMap}
+	// SSE stream without any usage block (include_usage was not set)
+	sseBody := []byte(
+		"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n" +
+			"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n" +
+			"data: [DONE]\n",
+	)
+	ctx := makeResponseContext(sseBody)
+	action := p.OnResponseBody(ctx, nil)
+	// Without usage data, cost should be calculated as 0 tokens (not a parse failure)
+	assertCostMetadata(t, ctx, action, costStatusCalculated, "0.0000000000")
+}

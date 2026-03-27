@@ -20,9 +20,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	policy "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
+)
+
+const (
+	sseDataPrefix = "data: "
+	sseDone       = "[DONE]"
 )
 
 const (
@@ -103,6 +109,18 @@ func (p *LLMCostPolicy) OnResponseBody(ctx *policy.ResponseContext, _ map[string
 
 	responseBody := ctx.ResponseBody.Content
 
+	// If the response body is buffered SSE events rather than a single JSON
+	// object, merge all events into one JSON blob so the downstream calculators
+	// can parse it with a regular json.Unmarshal.
+	if isSSEContent(responseBody) {
+		merged, err := mergeSSEEvents(responseBody)
+		if err != nil {
+			slog.Warn("llm-cost: failed to merge SSE events", "error", err)
+			return setCostMetadata(ctx, 0.0, costStatusNotCalculated)
+		}
+		responseBody = merged
+	}
+
 	// Extract model name from response body.
 	// OpenAI-compatible providers use $.model; Gemini uses $.modelVersion.
 	var probe struct {
@@ -164,6 +182,88 @@ func (p *LLMCostPolicy) OnResponseBody(ctx *policy.ResponseContext, _ map[string
 	)
 
 	return setCostMetadata(ctx, finalCost, costStatusCalculated)
+}
+
+// isSSEContent reports whether the body looks like buffered SSE data (has at
+// least one "data: " line).
+func isSSEContent(b []byte) bool {
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeSSEEvents parses every SSE "data:" line as JSON and shallow-merges all
+// top-level keys into a single object (later events win). This produces a
+// JSON blob that contains the `model` from early events together with the
+// `usage` / `usageMetadata` from the final event, allowing existing
+// provider calculators to parse it unchanged.
+//
+// Anthropic streaming sends usage across two events:
+//   - message_start → message.usage.input_tokens
+//   - message_delta → usage.output_tokens
+//
+// The merge handles this by deep-merging the "usage" key: later values
+// override, but keys only present in earlier events are preserved.
+func mergeSSEEvents(body []byte) ([]byte, error) {
+	merged := make(map[string]interface{})
+
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		jsonStr = strings.TrimSpace(jsonStr)
+		if jsonStr == sseDone || jsonStr == "" {
+			continue
+		}
+
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &event); err != nil {
+			continue // skip malformed lines
+		}
+
+		// Anthropic wraps the initial usage inside a "message" envelope.
+		// Hoist message.usage → top-level usage and message.model → model
+		// so they participate in the merge with later message_delta events.
+		if msg, ok := event["message"].(map[string]interface{}); ok {
+			if mu, ok := msg["usage"].(map[string]interface{}); ok {
+				if _, exists := event["usage"]; !exists {
+					event["usage"] = mu
+				}
+			}
+			if model, ok := msg["model"].(string); ok {
+				if _, exists := event["model"]; !exists {
+					event["model"] = model
+				}
+			}
+		}
+
+		for k, v := range event {
+			// Deep-merge "usage" and "usageMetadata" maps so that fields
+			// from earlier events (e.g. input_tokens) survive when a later
+			// event only carries output_tokens.
+			if (k == "usage" || k == "usageMetadata") && v != nil {
+				if newMap, ok := v.(map[string]interface{}); ok {
+					if existing, ok := merged[k].(map[string]interface{}); ok {
+						for ek, ev := range newMap {
+							existing[ek] = ev
+						}
+						continue
+					}
+				}
+			}
+			merged[k] = v
+		}
+	}
+
+	if len(merged) == 0 {
+		return nil, fmt.Errorf("no valid SSE events found")
+	}
+
+	return json.Marshal(merged)
 }
 
 // setCostMetadata writes x-llm-cost and x-llm-cost-status into SharedContext.Metadata

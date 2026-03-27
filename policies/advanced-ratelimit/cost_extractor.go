@@ -369,7 +369,14 @@ func extractFromMetadataMap(metadata map[string]interface{}, key string) (float6
 	return 0, false
 }
 
-// extractFromBodyBytes is a helper to extract cost from body bytes using JSONPath
+const (
+	sseDataPrefix = "data: "
+	sseDone       = "[DONE]"
+)
+
+// extractFromBodyBytes is a helper to extract cost from body bytes using JSONPath.
+// When the body is not valid JSON (e.g. buffered SSE events), it falls back to
+// parsing each SSE "data:" line individually and returns the last successful match.
 func extractFromBodyBytes(bodyBytes []byte, jsonPath string) (float64, bool) {
 	if len(bodyBytes) == 0 {
 		return 0, false
@@ -377,6 +384,10 @@ func extractFromBodyBytes(bodyBytes []byte, jsonPath string) (float64, bool) {
 
 	valueStr, err := utils.ExtractStringValueFromJsonpath(bodyBytes, jsonPath)
 	if err != nil {
+		// Fall back to SSE parsing: try JSONPath on each event, last match wins.
+		if cost, ok := extractFromSSEBodyBytes(bodyBytes, jsonPath); ok {
+			return cost, true
+		}
 		slog.Debug("Failed to extract cost from body",
 			"jsonPath", jsonPath,
 			"error", err)
@@ -393,6 +404,43 @@ func extractFromBodyBytes(bodyBytes []byte, jsonPath string) (float64, bool) {
 	}
 
 	return cost, true
+}
+
+// extractFromSSEBodyBytes parses buffered SSE events and applies the JSONPath
+// to each event individually. Returns the value from the last event that matches,
+// since usage data typically appears in the final event of the stream.
+func extractFromSSEBodyBytes(bodyBytes []byte, jsonPath string) (float64, bool) {
+	var lastVal float64
+	var found bool
+
+	for _, line := range strings.Split(string(bodyBytes), "\n") {
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		jsonStr = strings.TrimSpace(jsonStr)
+		if jsonStr == sseDone || jsonStr == "" {
+			continue
+		}
+
+		valueStr, err := utils.ExtractStringValueFromJsonpath([]byte(jsonStr), jsonPath)
+		if err != nil {
+			continue
+		}
+		cost, err := strconv.ParseFloat(valueStr, 64)
+		if err != nil {
+			continue
+		}
+		lastVal = cost
+		found = true
+	}
+
+	if found {
+		slog.Debug("Extracted cost from SSE event",
+			"jsonPath", jsonPath,
+			"value", lastVal)
+	}
+	return lastVal, found
 }
 
 // RequiresResponseBody returns true if any source requires response body access

@@ -23,13 +23,20 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	policy "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	utils "github.com/wso2/api-platform/sdk/core/utils"
-	embeddingproviders "github.com/wso2/api-platform/sdk/ai/utils/embeddingproviders"
-	vectordbproviders "github.com/wso2/api-platform/sdk/ai/utils/vectordbproviders"
+	embeddingproviders "github.com/wso2/api-platform/sdk/ai/embeddings"
+	vectordbproviders "github.com/wso2/api-platform/sdk/ai/vectordb"
+)
+
+const (
+	sseDataPrefix            = "data: "
+	sseDone                  = "[DONE]"
+	DefaultStreamingJsonPath = "$.choices[0].delta.content"
 )
 
 const (
@@ -46,6 +53,7 @@ type SemanticCachePolicy struct {
 	embeddingProvider   embeddingproviders.EmbeddingProvider
 	vectorStoreProvider vectordbproviders.VectorDBProvider
 	jsonPath            string
+	streamingJsonPath   string
 	threshold           float64
 }
 
@@ -223,6 +231,17 @@ func parseParams(params map[string]interface{}, p *SemanticCachePolicy) error {
 	// Optional JSONPath for extracting text from request body
 	if jsonPath, ok := params["jsonPath"].(string); ok {
 		p.jsonPath = jsonPath
+	}
+
+	// Optional JSONPath for extracting content from SSE streaming delta events.
+	// Defaults to $.choices[0].delta.content (OpenAI-compatible format).
+	p.streamingJsonPath = DefaultStreamingJsonPath
+	if streamingJsonPathRaw, ok := params["streamingJsonPath"]; ok {
+		if streamingJsonPath, ok := streamingJsonPathRaw.(string); ok {
+			p.streamingJsonPath = streamingJsonPath
+		} else {
+			return fmt.Errorf("'streamingJsonPath' must be a string")
+		}
 	}
 
 	return nil
@@ -443,12 +462,18 @@ func (p *SemanticCachePolicy) processResponseBody(ctx *policy.ResponseContext) p
 	// Parse response body
 	var responseData map[string]interface{}
 	if err := json.Unmarshal(content, &responseData); err != nil {
-		if isSSEResponse(ctx.ResponseHeaders) {
-			slog.Info("SemanticCache: Skipping cache storage for streaming response; buffered SSE events are not supported")
+		// If the body is not valid JSON, check if it is a buffered SSE stream
+		if isSSEResponse(ctx.ResponseHeaders) || isSSEContent(string(content)) {
+			assembled, sseErr := assembleSSEResponse(string(content), p.streamingJsonPath)
+			if sseErr != nil {
+				slog.Info("SemanticCache: Failed to reassemble SSE response for caching", "error", sseErr)
+				return policy.DownstreamResponseModifications{}
+			}
+			responseData = assembled
 		} else {
 			slog.Info("SemanticCache: Failed to parse response body, skipping cache storage", "error", err)
+			return policy.DownstreamResponseModifications{}
 		}
-		return policy.DownstreamResponseModifications{}
 	}
 
 	// Get API ID from context (use APIName and APIVersion to create unique ID)
@@ -491,6 +516,91 @@ func isSSEResponse(headers *policy.Headers) bool {
 		}
 	}
 	return false
+}
+
+// isSSEContent reports whether the body content looks like buffered SSE data.
+func isSSEContent(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, sseDataPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// assembleSSEResponse parses buffered SSE events and reconstructs a single
+// non-streaming JSON response suitable for caching. It uses streamingJsonPath
+// to extract content from each SSE event (e.g. "$.choices[0].delta.content"),
+// concatenates all extracted values, and rebuilds the last event with a
+// choices[*].message object containing the full content.
+func assembleSSEResponse(sseBody string, streamingJsonPath string) (map[string]interface{}, error) {
+	var contentParts []string
+	var lastEvent map[string]interface{}
+
+	for _, line := range strings.Split(sseBody, "\n") {
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		jsonStr := strings.TrimPrefix(line, sseDataPrefix)
+		jsonStr = strings.TrimSpace(jsonStr)
+		if jsonStr == sseDone || jsonStr == "" {
+			continue
+		}
+
+		var event map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &event); err != nil {
+			continue // skip malformed lines
+		}
+		lastEvent = event
+
+		// Extract content using the configurable streaming JSONPath
+		if text, err := utils.ExtractStringValueFromJsonpath([]byte(jsonStr), streamingJsonPath); err == nil && text != "" {
+			contentParts = append(contentParts, text)
+		}
+	}
+
+	if lastEvent == nil {
+		return nil, fmt.Errorf("no valid SSE events found")
+	}
+
+	// Build a non-streaming response using the last event as a template
+	assembled := make(map[string]interface{})
+	for k, v := range lastEvent {
+		assembled[k] = v
+	}
+	// Replace "chat.completion.chunk" with "chat.completion" if present
+	if obj, ok := assembled["object"].(string); ok && obj == "chat.completion.chunk" {
+		assembled["object"] = "chat.completion"
+	}
+
+	fullContent := strings.Join(contentParts, "")
+
+	// Rebuild choices with message instead of delta
+	if choices, ok := lastEvent["choices"].([]interface{}); ok && len(choices) > 0 {
+		newChoices := make([]interface{}, len(choices))
+		for i, c := range choices {
+			choice, ok := c.(map[string]interface{})
+			if !ok {
+				newChoices[i] = c
+				continue
+			}
+			newChoice := make(map[string]interface{})
+			for k, v := range choice {
+				if k == "delta" {
+					continue
+				}
+				newChoice[k] = v
+			}
+			newChoice["message"] = map[string]interface{}{
+				"role":    "assistant",
+				"content": fullContent,
+			}
+			newChoices[i] = newChoice
+		}
+		assembled["choices"] = newChoices
+	}
+
+	return assembled, nil
 }
 
 // buildErrorResponse builds a v1alpha2 error response for JSONPath extraction failures.
