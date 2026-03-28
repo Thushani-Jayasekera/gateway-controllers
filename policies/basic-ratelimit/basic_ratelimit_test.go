@@ -1,6 +1,7 @@
 package basicratelimit
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -28,6 +29,7 @@ func (s *stubDelegatePolicy) Mode() policy.ProcessingMode {
 }
 
 func (s *stubDelegatePolicy) OnRequestHeaders(
+	_ context.Context,
 	ctx *policy.RequestHeaderContext,
 	params map[string]interface{},
 ) policy.RequestHeaderAction {
@@ -38,6 +40,7 @@ func (s *stubDelegatePolicy) OnRequestHeaders(
 }
 
 func (s *stubDelegatePolicy) OnResponseHeaders(
+	_ context.Context,
 	ctx *policy.ResponseHeaderContext,
 	params map[string]interface{},
 ) policy.ResponseHeaderAction {
@@ -441,7 +444,7 @@ func TestBasicRateLimitPolicy_OnRequestHeaders_ForwardsContextParamsAndActionUnc
 		"limits": "as-provided",
 	}
 
-	gotAction := p.OnRequestHeaders(ctx, params)
+	gotAction := p.OnRequestHeaders(context.Background(), ctx, params)
 
 	if delegate.onRequestHeadersCalls != 1 {
 		t.Fatalf("expected delegate OnRequestHeaders to be called once, got %d", delegate.onRequestHeadersCalls)
@@ -487,7 +490,7 @@ func TestBasicRateLimitPolicy_OnResponseHeaders_ForwardsContextParamsAndActionUn
 		"key": "value",
 	}
 
-	gotAction := p.OnResponseHeaders(ctx, params)
+	gotAction := p.OnResponseHeaders(context.Background(), ctx, params)
 
 	if delegate.onResponseHeadersCalls != 1 {
 		t.Fatalf("expected delegate OnResponseHeaders to be called once, got %d", delegate.onResponseHeadersCalls)
