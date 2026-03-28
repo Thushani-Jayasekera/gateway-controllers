@@ -30,22 +30,22 @@ func (s *stubDelegatePolicy) Mode() policy.ProcessingMode {
 
 func (s *stubDelegatePolicy) OnRequestHeaders(
 	_ context.Context,
-	ctx *policy.RequestHeaderContext,
+	reqCtx *policy.RequestHeaderContext,
 	params map[string]interface{},
 ) policy.RequestHeaderAction {
 	s.onRequestHeadersCalls++
-	s.onRequestHeadersCtx = ctx
+	s.onRequestHeadersCtx = reqCtx
 	s.onRequestHeadersParams = params
 	return s.onRequestHeadersAction
 }
 
 func (s *stubDelegatePolicy) OnResponseHeaders(
 	_ context.Context,
-	ctx *policy.ResponseHeaderContext,
+	respCtx *policy.ResponseHeaderContext,
 	params map[string]interface{},
 ) policy.ResponseHeaderAction {
 	s.onResponseHeadersCalls++
-	s.onResponseHeadersCtx = ctx
+	s.onResponseHeadersCtx = respCtx
 	s.onResponseHeadersParams = params
 	return s.onResponseHeadersAction
 }

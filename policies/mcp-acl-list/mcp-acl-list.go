@@ -517,7 +517,7 @@ func (p *McpAclListPolicy) OnResponseBody(ctx context.Context, respCtx *policy.R
 	}
 
 	var responsePayload map[string]any
-	if err := json.Unmarshal(reqCtx.ResponseBody.Content, &responsePayload); err != nil {
+	if err := json.Unmarshal(respCtx.ResponseBody.Content, &responsePayload); err != nil {
 		slog.Debug("MCP ACL List Policy: Failed to parse MCP response", "capabilityType", capabilityType, "error", err)
 		return nil
 	}

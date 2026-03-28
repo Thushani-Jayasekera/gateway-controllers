@@ -914,13 +914,13 @@ func authHeader(headerName, scheme, token string) map[string][]string {
 	}
 }
 
-func assertAuthSuccess(t *testing.T, ctx *policy.RequestHeaderContext, action policy.RequestHeaderAction) {
+func assertAuthSuccess(t *testing.T, reqCtx *policy.RequestHeaderContext, action policy.RequestHeaderAction) {
 	t.Helper()
 
-	if ctx == nil {
+	if reqCtx == nil {
 		t.Fatalf("request context cannot be nil")
 	}
-	if ctx.SharedContext.AuthContext == nil || !ctx.SharedContext.AuthContext.Authenticated {
+	if reqCtx.SharedContext.AuthContext == nil || !reqCtx.SharedContext.AuthContext.Authenticated {
 		t.Fatalf("expected auth success, got unauthenticated context")
 	}
 	if _, ok := action.(policy.UpstreamRequestHeaderModifications); !ok {
@@ -928,13 +928,13 @@ func assertAuthSuccess(t *testing.T, ctx *policy.RequestHeaderContext, action po
 	}
 }
 
-func assertAuthFailure(t *testing.T, ctx *policy.RequestHeaderContext, action policy.RequestHeaderAction, statusCode int) {
+func assertAuthFailure(t *testing.T, reqCtx *policy.RequestHeaderContext, action policy.RequestHeaderAction, statusCode int) {
 	t.Helper()
 
-	if ctx == nil {
+	if reqCtx == nil {
 		t.Fatalf("request context cannot be nil")
 	}
-	if ctx.SharedContext.AuthContext != nil && ctx.SharedContext.AuthContext.Authenticated {
+	if reqCtx.SharedContext.AuthContext != nil && reqCtx.SharedContext.AuthContext.Authenticated {
 		t.Fatalf("expected auth failure, got authenticated context")
 	}
 

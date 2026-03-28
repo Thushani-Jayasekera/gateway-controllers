@@ -1775,7 +1775,6 @@ func TestOpenAICalculator_Normalize_MalformedBody(t *testing.T) {
 // Policy mode
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // setCostMetadata formatting
 // ---------------------------------------------------------------------------
@@ -1823,18 +1822,18 @@ func makeResponseContext(body []byte) *policy.ResponseContext {
 	return ctx
 }
 
-func assertCostMetadata(t *testing.T, ctx *policy.ResponseContext, action policy.ResponseAction, wantStatus string, wantCost string) {
+func assertCostMetadata(t *testing.T, respCtx *policy.ResponseContext, action policy.ResponseAction, wantStatus string, wantCost string) {
 	t.Helper()
 	_, ok := action.(policy.DownstreamResponseModifications)
 	if !ok {
 		t.Fatalf("expected DownstreamResponseModifications, got %T", action)
 	}
-	gotStatus, _ := ctx.Metadata[MetadataLLMCostStatus].(string)
+	gotStatus, _ := respCtx.Metadata[MetadataLLMCostStatus].(string)
 	if gotStatus != wantStatus {
 		t.Errorf("x-llm-cost-status: expected %q, got %q", wantStatus, gotStatus)
 	}
 	if wantCost != "" {
-		gotCost, _ := ctx.Metadata[MetadataLLMCost].(string)
+		gotCost, _ := respCtx.Metadata[MetadataLLMCost].(string)
 		if gotCost != wantCost {
 			t.Errorf("x-llm-cost: expected %q, got %q", wantCost, gotCost)
 		}

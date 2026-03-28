@@ -360,14 +360,14 @@ func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx 
 
 	// Accumulate delta.content from this chunk into the running total.
 	prev := ""
-	if v, ok := reqCtx.Metadata[metaKeyAccumulatedResponseContent]; ok {
+	if v, ok := respCtx.Metadata[metaKeyAccumulatedResponseContent]; ok {
 		if s, ok := v.(string); ok {
 			prev = s
 		}
 	}
 	chunkContent := extractSSEDeltaContent(chunkStr, rp.StreamingJsonPath)
 	accumulated := prev + chunkContent
-	reqCtx.Metadata[metaKeyAccumulatedResponseContent] = accumulated
+	respCtx.Metadata[metaKeyAccumulatedResponseContent] = accumulated
 
 	compiledRegex, err := regexp.Compile(rp.Regex)
 	if err != nil {

@@ -18,7 +18,6 @@
 package semantictoolfiltering
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"

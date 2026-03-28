@@ -624,13 +624,13 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 	// so that countSentences always operates on the full text seen so far,
 	// avoiding off-by-one errors at flush-window boundaries.
 	prev := ""
-	if v, ok := reqCtx.Metadata[metaKeyAccContent]; ok {
+	if v, ok := respCtx.Metadata[metaKeyAccContent]; ok {
 		if s, ok := v.(string); ok {
 			prev = s
 		}
 	}
 	fullContent := prev + extractSSEDeltaContent(chunkStr, rp.StreamingJsonPath)
-	reqCtx.Metadata[metaKeyAccContent] = fullContent
+	respCtx.Metadata[metaKeyAccContent] = fullContent
 	count := countSentences(fullContent)
 	isDone := chunk.EndOfStream
 

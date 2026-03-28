@@ -333,12 +333,12 @@ func buildInvalidConfigResponse(message string) policy.RequestAction {
 	}
 }
 
-func ensureRequestMetadata(ctx *policy.RequestContext) {
-	if ctx.SharedContext == nil {
-		ctx.SharedContext = &policy.SharedContext{}
+func ensureRequestMetadata(reqCtx *policy.RequestContext) {
+	if reqCtx.SharedContext == nil {
+		reqCtx.SharedContext = &policy.SharedContext{}
 	}
-	if ctx.Metadata == nil {
-		ctx.Metadata = map[string]any{}
+	if reqCtx.Metadata == nil {
+		reqCtx.Metadata = map[string]any{}
 	}
 }
 

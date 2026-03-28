@@ -245,14 +245,14 @@ func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Reque
 	authCtx := reqCtx.SharedContext.AuthContext
 	if authCtx == nil || !authCtx.Authenticated {
 		slog.Debug("MCP Authorization Policy: No authenticated context found")
-		return p.handleAuthFailure(ctx, "Unauthorized: scope/claim validation failed", nil)
+		return p.handleAuthFailure(reqCtx, "Unauthorized: scope/claim validation failed", nil)
 	}
 
 	// Parse MCP request to extract method and name
 	var mcpReq MCPRequest
 	if err := json.Unmarshal(reqCtx.Body.Content, &mcpReq); err != nil {
 		slog.Debug("MCP Authorization Policy: Failed to parse MCP request", "error", err)
-		return p.handleAuthFailure(ctx, "Invalid MCP request format", nil)
+		return p.handleAuthFailure(reqCtx, "Invalid MCP request format", nil)
 	}
 
 	slog.Debug("MCP Authorization Policy: Extracted MCP attributes",
@@ -284,7 +284,7 @@ func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Reque
 		slog.Debug("MCP Authorization Policy: Authorization check failed",
 			"attributeName", mcpReq.Params.Name,
 			"method", mcpReq.Method)
-		return p.handleAuthFailure(ctx, "Forbidden: insufficient permissions to access this MCP resource", missingScopes)
+		return p.handleAuthFailure(reqCtx, "Forbidden: insufficient permissions to access this MCP resource", missingScopes)
 	}
 
 	slog.Debug("MCP Authorization Policy: Authorization check passed")
@@ -295,7 +295,7 @@ func (p *McpAuthzPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Reque
 	return nil
 }
 
-func (p *McpAuthzPolicy) handleAuthFailure(ctx *policy.RequestContext, errorMessage string, scopeMap map[string]struct{}) policy.RequestAction {
+func (p *McpAuthzPolicy) handleAuthFailure(reqCtx *policy.RequestContext, errorMessage string, scopeMap map[string]struct{}) policy.RequestAction {
 	slog.Debug("MCP Authorization Policy: handleAuthFailure called",
 		"errorMessage", errorMessage,
 	)
@@ -305,7 +305,7 @@ func (p *McpAuthzPolicy) handleAuthFailure(ctx *policy.RequestContext, errorMess
 		missingScopes = append(missingScopes, s)
 	}
 
-	wwwAuthHeader := generateWwwAuthenticateHeader(ctx.Scheme, ctx.Authority, ctx.Vhost, ctx.APIContext, ctx.Metadata, missingScopes, errorMessage)
+	wwwAuthHeader := generateWwwAuthenticateHeader(reqCtx.Scheme, reqCtx.Authority, reqCtx.Vhost, reqCtx.APIContext, reqCtx.Metadata, missingScopes, errorMessage)
 
 	headers := map[string]string{
 		"content-type":        "application/json",
@@ -615,4 +615,3 @@ func parseAuthority(authority string) (host string, port int) {
 func isStandardPort(scheme string, port int) bool {
 	return (scheme == "http" && port == 80) || (scheme == "https" && port == 443)
 }
-

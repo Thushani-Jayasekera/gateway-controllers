@@ -437,14 +437,14 @@ func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 	// Add this chunk's delta.content bytes to the running total stored in metadata.
 	// Metadata persists across OnResponseBodyChunk invocations for the same request.
 	prev := 0
-	if v, ok := reqCtx.Metadata[metaKeyResponseRunningBytes]; ok {
+	if v, ok := respCtx.Metadata[metaKeyResponseRunningBytes]; ok {
 		if n, ok := v.(int); ok {
 			prev = n
 		}
 	}
 	chunkContent := extractSSEDeltaContent(chunkStr, rp.StreamingJsonPath)
 	running := prev + len([]byte(chunkContent))
-	reqCtx.Metadata[metaKeyResponseRunningBytes] = running
+	respCtx.Metadata[metaKeyResponseRunningBytes] = running
 
 	isDone := chunk.EndOfStream
 

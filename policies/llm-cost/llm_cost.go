@@ -118,7 +118,7 @@ func (p *LLMCostPolicy) OnResponseBody(ctx context.Context, respCtx *policy.Resp
 		merged, err := mergeSSEEvents(responseBody)
 		if err != nil {
 			slog.Warn("llm-cost: failed to merge SSE events", "error", err)
-			return setCostMetadata(reqCtx, 0.0, costStatusNotCalculated)
+			return setCostMetadata(respCtx, 0.0, costStatusNotCalculated)
 		}
 		responseBody = merged
 	}
@@ -155,27 +155,27 @@ func (p *LLMCostPolicy) OnResponseBody(ctx context.Context, respCtx *policy.Resp
 	pricing, found := lookupPricing(p.pricingMap, modelName)
 	if !found {
 		slog.Warn("llm-cost: no pricing entry for model, setting cost to 0", "model", modelName)
-		return setCostMetadata(reqCtx, 0.0, costStatusNotCalculated)
+		return setCostMetadata(respCtx, 0.0, costStatusNotCalculated)
 	}
 
 	// Select provider calculator.
 	calc := selectCalculator(pricing.Provider)
 	if calc == nil {
 		slog.Warn("llm-cost: unsupported provider, skipping cost calculation", "provider", pricing.Provider, "model", modelName)
-		return setCostMetadata(reqCtx, 0.0, costStatusNotCalculated)
+		return setCostMetadata(respCtx, 0.0, costStatusNotCalculated)
 	}
 
 	// Get buffered request body (may be nil for providers that don't need it).
 	var requestBody []byte
-	if reqCtx.RequestBody != nil && reqCtx.RequestBody.Present {
-		requestBody = reqCtx.RequestBody.Content
+	if respCtx.RequestBody != nil && respCtx.RequestBody.Present {
+		requestBody = respCtx.RequestBody.Content
 	}
 
 	// Normalize provider-specific usage fields into our common Usage struct.
 	usage, err := calc.Normalize(responseBody, requestBody)
 	if err != nil {
 		slog.Warn("llm-cost: failed to normalize usage", "model", modelName, "error", err)
-		return setCostMetadata(reqCtx, 0.0, costStatusNotCalculated)
+		return setCostMetadata(respCtx, 0.0, costStatusNotCalculated)
 	}
 
 	// Calculate base cost using the provider-agnostic generic calculator.
@@ -192,7 +192,7 @@ func (p *LLMCostPolicy) OnResponseBody(ctx context.Context, respCtx *policy.Resp
 		"cost_usd", finalCost,
 	)
 
-	return setCostMetadata(reqCtx, finalCost, costStatusCalculated)
+	return setCostMetadata(respCtx, finalCost, costStatusCalculated)
 }
 
 // isSSEContent reports whether the body looks like buffered SSE data (has at
@@ -264,16 +264,16 @@ func mergeSSEEvents(body []byte) ([]byte, error) {
 
 // setCostMetadata writes x-llm-cost and x-llm-cost-status into SharedContext.Metadata
 // for the v1alpha2 engine path.
-func setCostMetadata(ctx *policy.ResponseContext, costUSD float64, status string) policy.ResponseAction {
-	if ctx.SharedContext == nil {
+func setCostMetadata(respCtx *policy.ResponseContext, costUSD float64, status string) policy.ResponseAction {
+	if respCtx.SharedContext == nil {
 		slog.Warn("llm-cost: SharedContext is nil, cannot set cost metadata")
 		return policy.DownstreamResponseModifications{}
 	}
-	if ctx.Metadata == nil {
-		ctx.Metadata = make(map[string]interface{})
+	if respCtx.Metadata == nil {
+		respCtx.Metadata = make(map[string]interface{})
 	}
-	ctx.Metadata[MetadataLLMCost] = fmt.Sprintf("%.10f", costUSD)
-	ctx.Metadata[MetadataLLMCostStatus] = status
+	respCtx.Metadata[MetadataLLMCost] = fmt.Sprintf("%.10f", costUSD)
+	respCtx.Metadata[MetadataLLMCostStatus] = status
 	return policy.DownstreamResponseModifications{
 		AnalyticsMetadata: map[string]interface{}{
 			MetadataLLMCost: costUSD,

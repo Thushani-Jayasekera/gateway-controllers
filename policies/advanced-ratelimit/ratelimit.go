@@ -1222,7 +1222,7 @@ func (p *RateLimitPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.R
 
 // extractQuotaKeyFromHeaderCtx builds the rate limit key from header-phase context.
 // Supports all key types except "cel" (which requires full RequestContext).
-func (p *RateLimitPolicy) extractQuotaKeyFromHeaderCtx(ctx *policy.RequestHeaderContext, q *QuotaRuntime) string {
+func (p *RateLimitPolicy) extractQuotaKeyFromHeaderCtx(reqCtx *policy.RequestHeaderContext, q *QuotaRuntime) string {
 	if len(q.KeyExtraction) == 0 {
 		slog.Debug("No key extraction configured, using route name",
 			"routeName", p.routeName)
@@ -1230,7 +1230,7 @@ func (p *RateLimitPolicy) extractQuotaKeyFromHeaderCtx(ctx *policy.RequestHeader
 	}
 
 	if len(q.KeyExtraction) == 1 {
-		key := p.extractKeyComponentFromHeaderCtx(ctx, q.KeyExtraction[0])
+		key := p.extractKeyComponentFromHeaderCtx(reqCtx, q.KeyExtraction[0])
 		slog.Debug("Single component key extracted",
 			"type", q.KeyExtraction[0].Type,
 			"key", key)
@@ -1240,7 +1240,7 @@ func (p *RateLimitPolicy) extractQuotaKeyFromHeaderCtx(ctx *policy.RequestHeader
 	// Multiple components - join with ':' in the order specified
 	parts := make([]string, 0, len(q.KeyExtraction))
 	for _, comp := range q.KeyExtraction {
-		part := p.extractKeyComponentFromHeaderCtx(ctx, comp)
+		part := p.extractKeyComponentFromHeaderCtx(reqCtx, comp)
 		parts = append(parts, part)
 	}
 	key := strings.Join(parts, ":")
@@ -1251,10 +1251,10 @@ func (p *RateLimitPolicy) extractQuotaKeyFromHeaderCtx(ctx *policy.RequestHeader
 }
 
 // extractKeyComponentFromHeaderCtx extracts a single key component from header-phase context.
-func (p *RateLimitPolicy) extractKeyComponentFromHeaderCtx(ctx *policy.RequestHeaderContext, comp KeyComponent) string {
+func (p *RateLimitPolicy) extractKeyComponentFromHeaderCtx(reqCtx *policy.RequestHeaderContext, comp KeyComponent) string {
 	switch comp.Type {
 	case "header":
-		values := ctx.Headers.Get(strings.ToLower(comp.Key))
+		values := reqCtx.Headers.Get(strings.ToLower(comp.Key))
 		if len(values) > 0 && values[0] != "" {
 			return values[0]
 		}
@@ -1266,7 +1266,7 @@ func (p *RateLimitPolicy) extractKeyComponentFromHeaderCtx(ctx *policy.RequestHe
 		return comp.Key
 
 	case "metadata":
-		if val, ok := ctx.Metadata[comp.Key]; ok {
+		if val, ok := reqCtx.Metadata[comp.Key]; ok {
 			if strVal, ok := val.(string); ok && strVal != "" {
 				return strVal
 			}
@@ -1276,18 +1276,18 @@ func (p *RateLimitPolicy) extractKeyComponentFromHeaderCtx(ctx *policy.RequestHe
 		return placeholder
 
 	case "ip":
-		return p.extractIPAddress(ctx.Headers)
+		return p.extractIPAddress(reqCtx.Headers)
 
 	case "apiname":
-		if ctx.APIName != "" {
-			return ctx.APIName
+		if reqCtx.APIName != "" {
+			return reqCtx.APIName
 		}
 		slog.Warn("APIName not available for rate limit key, using empty string")
 		return ""
 
 	case "apiversion":
-		if ctx.APIVersion != "" {
-			return ctx.APIVersion
+		if reqCtx.APIVersion != "" {
+			return reqCtx.APIVersion
 		}
 		slog.Warn("APIVersion not available for rate limit key, using empty string")
 		return ""
@@ -1851,7 +1851,7 @@ func (p *RateLimitPolicy) OnResponseBody(ctx context.Context, respCtx *policy.Re
 	return policy.DownstreamResponseModifications{}
 }
 
-func (p *RateLimitPolicy) extractQuotaKey(ctx *policy.RequestContext, q *QuotaRuntime) string {
+func (p *RateLimitPolicy) extractQuotaKey(reqCtx *policy.RequestContext, q *QuotaRuntime) string {
 	if len(q.KeyExtraction) == 0 {
 		slog.Debug("No key extraction configured, using route name",
 			"routeName", p.routeName)
@@ -1859,7 +1859,7 @@ func (p *RateLimitPolicy) extractQuotaKey(ctx *policy.RequestContext, q *QuotaRu
 	}
 
 	if len(q.KeyExtraction) == 1 {
-		key := p.extractKeyComponent(ctx, q.KeyExtraction[0])
+		key := p.extractKeyComponent(reqCtx, q.KeyExtraction[0])
 		slog.Debug("Single component key extracted",
 			"type", q.KeyExtraction[0].Type,
 			"key", key)
@@ -1869,7 +1869,7 @@ func (p *RateLimitPolicy) extractQuotaKey(ctx *policy.RequestContext, q *QuotaRu
 	// Multiple components - join with ':' in the order specified
 	parts := make([]string, 0, len(q.KeyExtraction))
 	for _, comp := range q.KeyExtraction {
-		part := p.extractKeyComponent(ctx, comp)
+		part := p.extractKeyComponent(reqCtx, comp)
 		parts = append(parts, part)
 	}
 	key := strings.Join(parts, ":")
@@ -1880,10 +1880,10 @@ func (p *RateLimitPolicy) extractQuotaKey(ctx *policy.RequestContext, q *QuotaRu
 }
 
 // extractKeyComponent extracts a single component value
-func (p *RateLimitPolicy) extractKeyComponent(ctx *policy.RequestContext, comp KeyComponent) string {
+func (p *RateLimitPolicy) extractKeyComponent(reqCtx *policy.RequestContext, comp KeyComponent) string {
 	switch comp.Type {
 	case "header":
-		values := ctx.Headers.Get(strings.ToLower(comp.Key))
+		values := reqCtx.Headers.Get(strings.ToLower(comp.Key))
 		if len(values) > 0 && values[0] != "" {
 			return values[0]
 		}
@@ -1895,7 +1895,7 @@ func (p *RateLimitPolicy) extractKeyComponent(ctx *policy.RequestContext, comp K
 		return comp.Key
 
 	case "metadata":
-		if val, ok := ctx.Metadata[comp.Key]; ok {
+		if val, ok := reqCtx.Metadata[comp.Key]; ok {
 			if strVal, ok := val.(string); ok && strVal != "" {
 				return strVal
 			}
@@ -1905,18 +1905,18 @@ func (p *RateLimitPolicy) extractKeyComponent(ctx *policy.RequestContext, comp K
 		return placeholder
 
 	case "ip":
-		return p.extractIPAddress(ctx.Headers)
+		return p.extractIPAddress(reqCtx.Headers)
 
 	case "apiname":
-		if ctx.APIName != "" {
-			return ctx.APIName
+		if reqCtx.APIName != "" {
+			return reqCtx.APIName
 		}
 		slog.Warn("APIName not available for rate limit key, using empty string")
 		return ""
 
 	case "apiversion":
-		if ctx.APIVersion != "" {
-			return ctx.APIVersion
+		if reqCtx.APIVersion != "" {
+			return reqCtx.APIVersion
 		}
 		slog.Warn("APIVersion not available for rate limit key, using empty string")
 		return ""
@@ -1932,7 +1932,7 @@ func (p *RateLimitPolicy) extractKeyComponent(ctx *policy.RequestContext, comp K
 		}
 		slog.Debug("Evaluating CEL expression for key extraction",
 			"expression", comp.Expression)
-		result, err := evaluator.EvaluateKeyExpression(comp.Expression, ctx, p.routeName)
+		result, err := evaluator.EvaluateKeyExpression(comp.Expression, reqCtx, p.routeName)
 		if err != nil {
 			slog.Warn("CEL key extraction failed, using placeholder", "expression", comp.Expression, "error", err)
 			return "_cel_eval_error_"
