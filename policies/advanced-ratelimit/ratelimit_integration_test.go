@@ -2411,7 +2411,7 @@ func TestBugHunt_GCRAZeroLimitShouldNotPanicOnRequest(t *testing.T) {
 	}()
 
 	ctx := newRequestCtx(nil, nil)
-	_ = p.OnRequestBody(ctx, nil)
+	_ = p.OnRequestBody(context.Background(), ctx, nil)
 }
 */
 

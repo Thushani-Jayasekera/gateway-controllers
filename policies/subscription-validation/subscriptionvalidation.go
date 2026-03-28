@@ -209,7 +209,7 @@ func (p *SubscriptionValidationPolicy) Mode() policy.ProcessingMode {
 
 // OnRequestHeaders validates the subscription in the request header phase.
 func (p *SubscriptionValidationPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
-	if ctx == nil || reqCtx.SharedContext == nil {
+	if ctx == nil || reqCtx == nil || reqCtx.SharedContext == nil {
 		return p.forbiddenResponse("request context is missing").(policy.ImmediateResponse)
 	}
 
