@@ -1,6 +1,7 @@
 package jwtauth
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -402,11 +403,11 @@ func TestJWTAuthPolicy_Edge_JWKSCacheHit_SkipsRefetch(t *testing.T) {
 	p := mustGetPolicy(t, params)
 
 	ctx1 := createMockRequestHeaderContext(authHeader("Authorization", "Bearer", token))
-	action1 := p.(*JwtAuthPolicy).OnRequestHeaders(ctx1, params)
+	action1 := p.(*JwtAuthPolicy).OnRequestHeaders(context.Background(), ctx1, params)
 	assertAuthSuccess(t, ctx1, action1)
 
 	ctx2 := createMockRequestHeaderContext(authHeader("Authorization", "Bearer", token))
-	action2 := p.(*JwtAuthPolicy).OnRequestHeaders(ctx2, params)
+	action2 := p.(*JwtAuthPolicy).OnRequestHeaders(context.Background(), ctx2, params)
 	assertAuthSuccess(t, ctx2, action2)
 
 	if got := atomic.LoadInt32(&requestCount); got != 1 {
@@ -441,13 +442,13 @@ func TestJWTAuthPolicy_Edge_JWKSCacheExpiry_Refetches(t *testing.T) {
 	p := mustGetPolicy(t, params)
 
 	ctx1 := createMockRequestHeaderContext(authHeader("Authorization", "Bearer", token))
-	action1 := p.(*JwtAuthPolicy).OnRequestHeaders(ctx1, params)
+	action1 := p.(*JwtAuthPolicy).OnRequestHeaders(context.Background(), ctx1, params)
 	assertAuthSuccess(t, ctx1, action1)
 
 	time.Sleep(25 * time.Millisecond)
 
 	ctx2 := createMockRequestHeaderContext(authHeader("Authorization", "Bearer", token))
-	action2 := p.(*JwtAuthPolicy).OnRequestHeaders(ctx2, params)
+	action2 := p.(*JwtAuthPolicy).OnRequestHeaders(context.Background(), ctx2, params)
 	assertAuthSuccess(t, ctx2, action2)
 
 	if got := atomic.LoadInt32(&requestCount); got < 2 {
@@ -866,7 +867,7 @@ func executeOnRequestHeaders(t *testing.T, params map[string]interface{}, header
 	t.Helper()
 	p := mustGetPolicy(t, params)
 	ctx := createMockRequestHeaderContext(headers)
-	return ctx, p.(*JwtAuthPolicy).OnRequestHeaders(ctx, params)
+	return ctx, p.(*JwtAuthPolicy).OnRequestHeaders(context.Background(), ctx, params)
 }
 
 func mustGetPolicy(t *testing.T, params map[string]interface{}) policy.Policy {
