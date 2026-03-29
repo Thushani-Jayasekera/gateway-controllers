@@ -482,6 +482,64 @@ func extractFromSSEBodyBytes(bodyBytes []byte, jsonPath string) (float64, bool) 
 	return lastVal, found
 }
 
+// parseSSEChunk scans buf for complete SSE lines (newline-delimited) and applies
+// jsonPath to the JSON payload of each data: or event: line.
+//
+// It returns:
+//   - lastCost:  the numeric value from the last line that matched jsonPath
+//   - found:     true if at least one line yielded a value
+//   - remaining: any bytes after the last newline (an incomplete line); the caller
+//                must prepend these to the next chunk before calling parseSSEChunk
+//                again to guard against JSON payloads split across chunk boundaries
+//
+// last-match-wins is intentional: LLM providers send the authoritative token count
+// in the final usage event, so overwriting on each match naturally yields the right
+// value without needing to know which event is "last" in advance.
+func parseSSEChunk(buf []byte, jsonPath string) (lastCost float64, found bool, remaining []byte) {
+	s := string(buf)
+	for {
+		idx := strings.IndexByte(s, '\n')
+		if idx < 0 {
+			// No complete line remaining — return the fragment so the caller
+			// can prepend it to the next chunk.
+			return lastCost, found, []byte(s)
+		}
+		line := strings.TrimRight(s[:idx], "\r") // strip optional \r from CRLF line endings
+		s = s[idx+1:]
+
+		var value string
+		switch {
+		case strings.HasPrefix(line, sseDataPrefix):
+			value = strings.TrimPrefix(line, sseDataPrefix)
+		case strings.HasPrefix(line, sseEventPrefix):
+			// event: lines carry the event type name, not a JSON payload —
+			// included here for completeness but rarely contain the usage field.
+			value = strings.TrimSpace(strings.TrimPrefix(line, sseEventPrefix))
+		default:
+			// comment (: ...), id:, retry:, or blank separator line — ignore
+			continue
+		}
+
+		if value == sseDone || value == "" {
+			// Stream terminator or empty data field — nothing to extract.
+			continue
+		}
+
+		valueStr, err := utils.ExtractStringValueFromJsonpath([]byte(value), jsonPath)
+		if err != nil {
+			// jsonPath not present in this event. Expected for content chunks
+			// (e.g. delta text events) — only trailing usage events carry the field.
+			continue
+		}
+		cost, err := strconv.ParseFloat(valueStr, 64)
+		if err != nil {
+			continue
+		}
+		lastCost = cost
+		found = true // will be overwritten if a later line also matches (last-match-wins)
+	}
+}
+
 // RequiresResponseBody returns true if any source requires response body access
 func (e *CostExtractor) RequiresResponseBody() bool {
 	if !e.config.Enabled {

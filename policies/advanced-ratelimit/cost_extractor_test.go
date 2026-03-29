@@ -585,3 +585,108 @@ func TestCostExtractor_AnthropicSSE_OnlyMessageDeltaMatches(t *testing.T) {
 		t.Error("expected no match when no event carries $.usage.output_tokens")
 	}
 }
+
+// ─── parseSSEChunk unit tests ─────────────────────────────────────────────────
+
+func TestParseSSEChunk_SingleChunkWithUsage(t *testing.T) {
+	buf := []byte("data: {\"usage\":{\"total_tokens\":75}}\n")
+	cost, found, remaining := parseSSEChunk(buf, "$.usage.total_tokens")
+	if !found {
+		t.Fatal("expected found=true")
+	}
+	if cost != 75 {
+		t.Fatalf("expected cost=75, got %v", cost)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("expected empty remaining, got %q", remaining)
+	}
+}
+
+func TestParseSSEChunk_PartialLineCarriedForward(t *testing.T) {
+	// First chunk ends mid-JSON — no newline, so the whole thing is returned as remaining.
+	chunk1 := []byte(`data: {"usage":{"total_tokens":`)
+	_, found1, rem1 := parseSSEChunk(chunk1, "$.usage.total_tokens")
+	if found1 {
+		t.Fatal("expected found=false for incomplete line")
+	}
+	if string(rem1) != string(chunk1) {
+		t.Fatalf("expected remaining=%q, got %q", chunk1, rem1)
+	}
+
+	// Second chunk completes the line. Prepend remaining to simulate the caller's behaviour.
+	chunk2 := append(rem1, []byte("42}}\n")...)
+	cost, found2, _ := parseSSEChunk(chunk2, "$.usage.total_tokens")
+	if !found2 {
+		t.Fatal("expected found=true after combining partial remainder with next chunk")
+	}
+	if cost != 42 {
+		t.Fatalf("expected cost=42, got %v", cost)
+	}
+}
+
+func TestParseSSEChunk_LastMatchWins(t *testing.T) {
+	// Two data: lines both contain the jsonPath — the second value must win.
+	buf := []byte("data: {\"usage\":{\"total_tokens\":10}}\n" +
+		"data: {\"usage\":{\"total_tokens\":99}}\n")
+	cost, found, _ := parseSSEChunk(buf, "$.usage.total_tokens")
+	if !found {
+		t.Fatal("expected found=true")
+	}
+	if cost != 99 {
+		t.Fatalf("expected 99 (last-match-wins), got %v", cost)
+	}
+}
+
+func TestParseSSEChunk_NoMatchingField(t *testing.T) {
+	// data: line exists but jsonPath is absent — found must be false.
+	buf := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n")
+	_, found, remaining := parseSSEChunk(buf, "$.usage.total_tokens")
+	if found {
+		t.Fatal("expected found=false when jsonPath absent from payload")
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("expected empty remaining after complete line, got %q", remaining)
+	}
+}
+
+func TestParseSSEChunk_DoneTerminatorSkipped(t *testing.T) {
+	buf := []byte("data: [DONE]\n")
+	_, found, _ := parseSSEChunk(buf, "$.usage.total_tokens")
+	if found {
+		t.Fatal("expected found=false for [DONE] terminator")
+	}
+}
+
+func TestParseSSEChunk_BlankAndCommentLinesSkipped(t *testing.T) {
+	// Blank separator lines and comment lines must be ignored; the data: line must match.
+	buf := []byte("\n: this is a comment\ndata: {\"usage\":{\"total_tokens\":5}}\n")
+	cost, found, _ := parseSSEChunk(buf, "$.usage.total_tokens")
+	if !found {
+		t.Fatal("expected found=true")
+	}
+	if cost != 5 {
+		t.Fatalf("expected cost=5, got %v", cost)
+	}
+}
+
+func TestParseSSEChunk_CRLFLineEndings(t *testing.T) {
+	// Some providers send CRLF line endings — \r must be stripped.
+	buf := []byte("data: {\"usage\":{\"total_tokens\":37}}\r\n")
+	cost, found, _ := parseSSEChunk(buf, "$.usage.total_tokens")
+	if !found {
+		t.Fatal("expected found=true with CRLF line endings")
+	}
+	if cost != 37 {
+		t.Fatalf("expected cost=37, got %v", cost)
+	}
+}
+
+func TestParseSSEChunk_EmptyChunk(t *testing.T) {
+	_, found, remaining := parseSSEChunk([]byte{}, "$.usage.total_tokens")
+	if found {
+		t.Fatal("expected found=false for empty chunk")
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("expected empty remaining for empty chunk")
+	}
+}

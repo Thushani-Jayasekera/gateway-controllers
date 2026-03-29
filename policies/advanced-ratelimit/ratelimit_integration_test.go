@@ -678,16 +678,21 @@ func TestModeBehavior(t *testing.T) {
 			wantResBody: policy.BodyModeSkip,
 		},
 		{
+			// response_body uses BodyModeStream so the policy can process SSE events
+			// per-chunk and avoid buffering the entire LLM response in memory.
+			// OnResponseBody remains as the buffered fallback when another policy in
+			// the chain forces BodyModeBuffer.
 			name:        "response body source",
 			quotas:      []QuotaRuntime{mkQuota(true, []CostSource{{Type: CostSourceResponseBody, JSONPath: "$.usage.total"}})},
 			wantReqBody: policy.BodyModeSkip,
-			wantResBody: policy.BodyModeBuffer,
+			wantResBody: policy.BodyModeStream,
 		},
 		{
+			// request_body buffers the request; response_body streams the response.
 			name:        "mixed body sources",
 			quotas:      []QuotaRuntime{mkQuota(true, []CostSource{{Type: CostSourceRequestBody, JSONPath: "$.in"}, {Type: CostSourceResponseBody, JSONPath: "$.out"}})},
 			wantReqBody: policy.BodyModeBuffer,
-			wantResBody: policy.BodyModeBuffer,
+			wantResBody: policy.BodyModeStream,
 		},
 		{
 			name:        "configured but effectively disabled",
@@ -714,10 +719,13 @@ func TestModeBehavior(t *testing.T) {
 			wantResBody: policy.BodyModeSkip,
 		},
 		{
+			// response_metadata uses BodyModeStream: metadata written by upstream policies
+			// is available in SharedContext at EOS, read via the synthetic ResponseContext
+			// built in finalizeAndConsumeStreamingCosts.
 			name:        "response metadata source requires response body phase",
 			quotas:      []QuotaRuntime{mkQuota(true, []CostSource{{Type: CostSourceResponseMetadata, Key: "x-llm-cost"}})},
 			wantReqBody: policy.BodyModeSkip,
-			wantResBody: policy.BodyModeBuffer,
+			wantResBody: policy.BodyModeStream,
 		},
 	}
 
@@ -2508,6 +2516,307 @@ func TestBugHunt_MultiplierTypeShouldBeValidated(t *testing.T) {
 	}
 }
 */
+
+// newResponseStreamCtx builds a ResponseStreamContext for use in OnResponseBodyChunk tests.
+// metadata should contain at least rateLimitKeysKey so EOS cost consumption can resolve quota keys.
+func newResponseStreamCtx(reqHeaders, respHeaders map[string][]string, metadata map[string]interface{}, status int) *policy.ResponseStreamContext {
+	if metadata == nil {
+		metadata = map[string]interface{}{}
+	}
+	if reqHeaders == nil {
+		reqHeaders = map[string][]string{}
+	}
+	if respHeaders == nil {
+		respHeaders = map[string][]string{}
+	}
+	return &policy.ResponseStreamContext{
+		SharedContext: &policy.SharedContext{
+			Metadata:   metadata,
+			APIName:    "petstore",
+			APIVersion: "v1",
+			APIId:      "api-id",
+			APIContext: "/petstore",
+		},
+		RequestHeaders:  policy.NewHeaders(reqHeaders),
+		ResponseHeaders: policy.NewHeaders(respHeaders),
+		ResponseStatus:  status,
+	}
+}
+
+// sendChunks is a test helper that calls OnResponseBodyChunk for each provided byte slice.
+// The last slice is delivered with EndOfStream=true. It uses the same respCtx for all calls
+// so that the per-request streaming state in Metadata accumulates correctly.
+func sendChunks(t *testing.T, p *RateLimitPolicy, respCtx *policy.ResponseStreamContext, chunks [][]byte) {
+	t.Helper()
+	for i, c := range chunks {
+		eos := i == len(chunks)-1
+		chunk := &policy.StreamBody{Chunk: c, EndOfStream: eos, Index: uint64(i)}
+		p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
+	}
+}
+
+// ─── OnResponseBodyChunk integration tests ───────────────────────────────────
+
+func TestOnResponseBodyChunk_OpenAISSE_MultiChunk(t *testing.T) {
+	// Simulate an OpenAI SSE stream split across three chunks.
+	// The final data: line before [DONE] carries usage — last-match-wins gives total_tokens=75.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{{Type: CostSourceResponseBody, JSONPath: "$.usage.total_tokens", Multiplier: 1}},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name: "tokens", Limiter: lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-openai",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "openai-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	chunks := [][]byte{
+		// Chunk 0: first content delta — no usage field
+		[]byte("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n"),
+		// Chunk 1: final delta with usage (stream_options: {include_usage: true})
+		[]byte("data: {\"id\":\"chatcmpl-1\",\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":50,\"total_tokens\":75}}\n"),
+		// Chunk 2: [DONE] terminator with EOS
+		[]byte("data: [DONE]\n"),
+	}
+	sendChunks(t, p, respCtx, chunks)
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 75 {
+		t.Fatalf("expected cost=75 from usage.total_tokens, got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_AnthropicSSE_OutputTokens(t *testing.T) {
+	// Anthropic streams usage in the message_delta event. The message_stop event that
+	// follows has no usage field, so last-match-wins returns output_tokens=20.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{{Type: CostSourceResponseBody, JSONPath: "$.usage.output_tokens", Multiplier: 1}},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name: "tokens", Limiter: lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-anthropic",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "anthropic-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// Deliver the full Anthropic SSE body as a single chunk with EOS.
+	// anthropicSSEBody has message_delta with usage.output_tokens=20.
+	chunk := &policy.StreamBody{
+		Chunk:       []byte(anthropicSSEBody),
+		EndOfStream: true,
+		Index:       0,
+	}
+	p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 20 {
+		t.Fatalf("expected cost=20 from usage.output_tokens, got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_PlainJSONChunked_AccumulateAndExtractAtEOS(t *testing.T) {
+	// Plain JSON response delivered as two chunks (chunked transfer encoding).
+	// The policy must accumulate both chunks and extract the jsonPath only at EOS.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{{Type: CostSourceResponseBody, JSONPath: "$.tokens", Multiplier: 1}},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name: "tokens", Limiter: lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-json",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "json-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// Split the JSON body across two chunks so the parser cannot extract mid-stream.
+	sendChunks(t, p, respCtx, [][]byte{
+		[]byte(`{"result":"ok","tok`),
+		[]byte(`ens":42}`),
+	})
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once at EOS, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 42 {
+		t.Fatalf("expected cost=42 from $.tokens, got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_NoUsageField_FallsBackToDefault(t *testing.T) {
+	// When the jsonPath is absent from all SSE events, the configured default cost is used.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 5, // fallback
+		Sources: []CostSource{{Type: CostSourceResponseBody, JSONPath: "$.usage.total_tokens", Multiplier: 1}},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name: "tokens", Limiter: lim,
+			Limits:                []LimitConfig{{Limit: 1000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-nofield",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "nf-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// SSE body where no data: line carries $.usage.total_tokens.
+	sendChunks(t, p, respCtx, [][]byte{
+		[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n"),
+		[]byte("data: [DONE]\n"),
+	})
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once (with default), got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 5 {
+		t.Fatalf("expected cost=5 (default), got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_MultiplierApplied(t *testing.T) {
+	// Extracted value is multiplied before consumption.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{{Type: CostSourceResponseBody, JSONPath: "$.usage.total_tokens", Multiplier: 0.5}},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name: "tokens", Limiter: lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-multiplier",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "mul-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// total_tokens=100, multiplier=0.5 → expected cost=50
+	chunk := &policy.StreamBody{
+		Chunk:       []byte("data: {\"usage\":{\"total_tokens\":100}}\n"),
+		EndOfStream: true,
+		Index:       0,
+	}
+	p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 50 {
+		t.Fatalf("expected cost=50 (100 × 0.5), got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_EmptyFirstChunkDeferrsSSEDetection(t *testing.T) {
+	// The first chunk may be a keep-alive (empty bytes). SSE detection must be deferred
+	// until the first non-empty chunk to avoid misidentifying the stream as JSON.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{{Type: CostSourceResponseBody, JSONPath: "$.usage.total_tokens", Multiplier: 1}},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name: "tokens", Limiter: lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-keepalive",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "ka-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	sendChunks(t, p, respCtx, [][]byte{
+		{},  // empty keep-alive — must not trigger JSON mode
+		[]byte("data: {\"usage\":{\"total_tokens\":33}}\n"),
+		[]byte("data: [DONE]\n"),
+	})
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 33 {
+		t.Fatalf("expected cost=33 after deferred SSE detection, got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_NoCostExtractionEnabled_NoConsume(t *testing.T) {
+	// Quotas without cost extraction enabled must not call ConsumeN.
+	lim := &fakeLimiter{}
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name: "basic", Limiter: lim,
+			Limits:                []LimitConfig{{Limit: 10, Duration: time.Minute}},
+			CostExtractionEnabled: false,
+		}},
+		routeName: "route-nocost",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"basic": "basic-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	sendChunks(t, p, respCtx, [][]byte{
+		[]byte("data: {\"usage\":{\"total_tokens\":99}}\n"),
+	})
+
+	if lim.consumeNCalls != 0 {
+		t.Fatalf("expected ConsumeN not called, got %d calls", lim.consumeNCalls)
+	}
+}
 
 // clearCaches resets all global caches for test isolation.
 func clearCaches() {

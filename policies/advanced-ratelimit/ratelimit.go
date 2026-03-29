@@ -418,8 +418,8 @@ func (p *RateLimitPolicy) Mode() policy.ProcessingMode {
 	if p.requiresRequestBody() {
 		requestBodyMode = policy.BodyModeBuffer
 	}
-	if p.requiresResponseBody() || p.hasNonHeaderResponsePhaseSources() {
-		responseBodyMode = policy.BodyModeBuffer
+	if p.requiresAnyResponseBodyMode() {
+		responseBodyMode = policy.BodyModeStream
 	}
 
 	return policy.ProcessingMode{
@@ -435,6 +435,7 @@ const (
 	rateLimitResultKey        = "ratelimit:result"
 	rateLimitKeysKey          = "ratelimit:keys"           // Store extracted keys for post-response cost extraction
 	rateLimitHeaderHandledKey = "ratelimit:header_handled" // Quota names fully handled in header phase
+	rateLimitStreamStateKey   = "ratelimit:stream_state"   // Per-request SSE/JSON streaming accumulation state
 )
 
 // quotaResult stores the result of checking a single quota
@@ -443,6 +444,27 @@ type quotaResult struct {
 	Result    *limiter.Result
 	Key       string
 	Duration  time.Duration // Window duration for IETF RateLimit-Policy header
+}
+
+// streamQuotaState holds per-request accumulation state for one quota while the
+// response body is being processed chunk-by-chunk in streaming mode.
+// A separate instance is stored per quota name inside rateLimitStreamStateKey so
+// that multiple quotas on the same request track their state independently.
+type streamQuotaState struct {
+	lastCost    float64 // most recently extracted cost value; overwritten on each matching chunk (last-match-wins)
+	found       bool    // true once at least one chunk yielded a value for the configured jsonPath
+	isSSE       *bool   // nil = format not yet determined; set on first non-empty chunk and fixed for the stream lifetime
+	partialLine []byte  // SSE mode: bytes after the last newline in the current chunk, carried forward to the next
+	accumulated []byte  // JSON mode: raw body bytes gathered across all chunks; extracted once at EOS
+}
+
+// quotaNameFor returns the display/lookup name for a quota.
+// Used consistently across streaming methods to avoid duplicating the fallback logic.
+func quotaNameFor(q *QuotaRuntime, index int) string {
+	if q.Name != "" {
+		return q.Name
+	}
+	return fmt.Sprintf("quota-%d", index)
 }
 
 // buildMultiQuotaHeaders creates rate limit headers for all quotas.
@@ -922,36 +944,44 @@ func (p *RateLimitPolicy) requiresRequestBody() bool {
 	return false
 }
 
-// requiresResponseBody returns true if any quota requires response body processing.
-func (p *RateLimitPolicy) requiresResponseBody() bool {
+
+// requiresAnyResponseBodyMode returns true if any quota has a response-phase cost
+// source that is not response_header. This is the single gating check used by
+// Mode() to request BodyModeStream and by OnResponseBody to guard the buffered
+// fallback path.
+//
+// response_header-only quotas are fully handled in OnResponseHeaders and are
+// excluded here to avoid requesting an unnecessary body phase.
+func (p *RateLimitPolicy) requiresAnyResponseBodyMode() bool {
 	for _, q := range p.quotas {
-		if q.CostExtractionEnabled && q.CostExtractor != nil {
-			if q.CostExtractor.RequiresResponseBody() {
-				return true
-			}
+		if !q.CostExtractionEnabled || q.CostExtractor == nil {
+			continue
+		}
+		// Skip quotas whose only response sources are response_header — those are
+		// consumed entirely in OnResponseHeaders with no body involvement.
+		if q.CostExtractor.HasResponseHeaderOnlyCostSources() {
+			continue
+		}
+		if q.CostExtractor.HasResponsePhaseSources() {
+			return true
 		}
 	}
 	return false
 }
 
-// hasNonHeaderResponsePhaseSources returns true if any quota has response-phase cost
-// sources that are not response_header (e.g. response_metadata, response_body,
-// response_cel). These require OnResponseBody to run — either because they need
-// the body content, or because the metadata they read is populated by upstream
-// policies that execute in the response-body phase.
-func (p *RateLimitPolicy) hasNonHeaderResponsePhaseSources() bool {
-	for _, q := range p.quotas {
-		if q.CostExtractionEnabled && q.CostExtractor != nil {
-			// response_header-only quotas are consumed in OnResponseHeaders — exclude them.
-			if q.CostExtractor.HasResponseHeaderOnlyCostSources() {
-				continue
-			}
-			if q.CostExtractor.HasResponsePhaseSources() && !q.CostExtractor.RequiresResponseBody() {
-				return true
-			}
-		}
+// hasStreamingResponseSourceForQuota returns true if the given quota has any
+// response-phase cost source that should be processed in the streaming path
+// (i.e. anything other than response_header, which is handled earlier).
+// Used in finalizeAndConsumeStreamingCosts to skip quotas that were already
+// fully consumed in OnResponseHeaders.
+func (p *RateLimitPolicy) hasStreamingResponseSourceForQuota(q *QuotaRuntime) bool {
+	if q.CostExtractor == nil {
+		return false
 	}
-	return false
+	if q.CostExtractor.HasResponseHeaderOnlyCostSources() {
+		return false
+	}
+	return q.CostExtractor.HasResponsePhaseSources()
 }
 
 // getLimitFromQuota returns the limit from a quota's first limit config, or 0 if none
@@ -1722,7 +1752,7 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx context.Context, respCtx *policy
 	// If body/metadata sources exist, OnResponseBody will process those quotas
 	// and emit the final complete headers — building partial headers here would
 	// be incorrect and they would be overwritten anyway.
-	if p.requiresResponseBody() || p.hasNonHeaderResponsePhaseSources() {
+	if p.requiresAnyResponseBodyMode() {
 		return nil
 	}
 
@@ -1755,7 +1785,7 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx context.Context, respCtx *policy
 func (p *RateLimitPolicy) OnResponseBody(ctx context.Context, respCtx *policy.ResponseContext,
 	_ map[string]interface{},
 ) policy.ResponseAction {
-	if p.requiresResponseBody() || p.hasNonHeaderResponsePhaseSources() {
+	if p.requiresAnyResponseBodyMode() {
 		slog.Debug("Processing rate limit response phase",
 			"route", p.routeName,
 			"status", respCtx.ResponseStatus,
@@ -2030,4 +2060,251 @@ func (p *RateLimitPolicy) extractIPAddress(headers *policy.Headers) string {
 
 	slog.Warn("Could not extract IP address for rate limit key, using 'unknown'")
 	return "unknown"
+}
+
+// ─── Streaming response body (StreamingResponsePolicy) ───────────────────────
+
+// getOrInitStreamState loads the per-request streaming state map from shared metadata,
+// creating and storing it if this is the first chunk of the request.
+// Each quota gets its own streamQuotaState entry keyed by quota name.
+func (p *RateLimitPolicy) getOrInitStreamState(metadata map[string]interface{}) map[string]*streamQuotaState {
+	if existing, ok := metadata[rateLimitStreamStateKey].(map[string]*streamQuotaState); ok {
+		return existing
+	}
+	state := make(map[string]*streamQuotaState, len(p.quotas))
+	for i := range p.quotas {
+		state[quotaNameFor(&p.quotas[i], i)] = &streamQuotaState{}
+	}
+	metadata[rateLimitStreamStateKey] = state
+	return state
+}
+
+// OnResponseBodyChunk is called by the kernel for every response body chunk when the
+// chain runs in FULL_DUPLEX_STREAMED mode (every policy returned BodyModeStream).
+//
+// It handles two formats transparently — detection happens on the first non-empty chunk
+// and is fixed for the lifetime of the stream:
+//
+//   - SSE  (data:/event: prefix detected): parse complete lines per chunk using
+//     parseSSEChunk; any bytes after the last newline are held in partialLine and
+//     prepended to the next chunk to guard against payloads split across boundaries.
+//     lastCost is overwritten on each matching event (last-match-wins), so the final
+//     usage value written by the LLM provider is what gets consumed at EOS.
+//
+//   - JSON (no SSE prefix): accumulate raw bytes in streamQuotaState.accumulated
+//     across all chunks; extract the jsonPath value once at EOS.
+//
+// The chunk is always passed through unmodified — this policy only observes the stream.
+// Token consumption happens in finalizeAndConsumeStreamingCosts at EOS.
+func (p *RateLimitPolicy) OnResponseBodyChunk(
+	ctx context.Context,
+	respCtx *policy.ResponseStreamContext,
+	chunk *policy.StreamBody,
+	_ map[string]interface{},
+) policy.ResponseChunkAction {
+	state := p.getOrInitStreamState(respCtx.Metadata)
+
+	for i := range p.quotas {
+		q := &p.quotas[i]
+		if !q.CostExtractionEnabled || q.CostExtractor == nil {
+			continue
+		}
+
+		quotaName := quotaNameFor(q, i)
+		qs := state[quotaName]
+
+		for _, src := range q.CostExtractor.GetConfig().Sources {
+			switch src.Type {
+			case CostSourceResponseBody:
+				// Detect SSE vs JSON on the first non-empty chunk.
+				// SSE streams always open with "data:" or "event:" on the first content line.
+				// Once set, isSSE stays fixed — we do not re-evaluate mid-stream.
+				if qs.isSSE == nil && len(chunk.Chunk) > 0 {
+					trimmed := strings.TrimLeft(string(chunk.Chunk), " \r\n")
+					isSSE := strings.HasPrefix(trimmed, "data:") || strings.HasPrefix(trimmed, "event:")
+					qs.isSSE = &isSSE
+					slog.Debug("Response body format detected",
+						"quota", quotaName, "isSSE", isSSE)
+				}
+
+				if qs.isSSE != nil && *qs.isSSE {
+					// SSE mode: parse this chunk for complete lines.
+					// Prepend any leftover bytes from the previous chunk so that a JSON
+					// payload split across a boundary is always evaluated as a whole line.
+					combined := append(qs.partialLine, chunk.Chunk...)
+					lastCost, found, remaining := parseSSEChunk(combined, src.JSONPath)
+					qs.partialLine = remaining
+					if found {
+						// Overwrite on each match: the provider's final usage event
+						// (which carries the authoritative token count) will be last.
+						qs.lastCost = lastCost * src.Multiplier
+						qs.found = true
+					}
+				} else {
+					// JSON mode: chunked transfer encoding splits the body arbitrarily.
+					// Accumulate all bytes; extraction runs once at EOS.
+					qs.accumulated = append(qs.accumulated, chunk.Chunk...)
+				}
+
+			case CostSourceResponseCEL:
+				// CEL expressions are evaluated against the complete response body,
+				// so we accumulate all bytes here and evaluate once at EOS —
+				// the same strategy as JSON response_body.
+				qs.accumulated = append(qs.accumulated, chunk.Chunk...)
+
+			case CostSourceResponseMetadata:
+				// Metadata is written to SharedContext by upstream policies during the
+				// stream. No per-chunk work is needed; the value is read at EOS from
+				// the synthetic ResponseContext built in finalizeAndConsumeStreamingCosts.
+
+			default:
+				// response_header sources are handled in OnResponseHeaders; skip.
+			}
+		}
+
+		state[quotaName] = qs
+	}
+	// Persist updated state so the next chunk call sees the latest partialLine /
+	// accumulated bytes / lastCost for each quota.
+	respCtx.Metadata[rateLimitStreamStateKey] = state
+
+	// EOS: all chunks have arrived. Finalize JSON extraction (SSE values are
+	// already up-to-date from per-chunk parsing) and consume tokens.
+	if chunk.EndOfStream {
+		p.finalizeAndConsumeStreamingCosts(ctx, respCtx, state)
+	}
+
+	return policy.ResponseChunkAction{} // passthrough — do not modify the chunk
+}
+
+// NeedsMoreResponseData always returns false.
+// For SSE we extract inline per chunk; for JSON we accumulate manually in
+// streamQuotaState.accumulated and extract at EOS. In neither case do we need
+// the kernel to buffer a minimum number of bytes before invoking OnResponseBodyChunk.
+func (p *RateLimitPolicy) NeedsMoreResponseData(_ []byte) bool {
+	return false
+}
+
+// finalizeAndConsumeStreamingCosts is called once when chunk.EndOfStream is true.
+//
+// For response_body SSE quotas the cost is already in streamQuotaState.lastCost from
+// per-chunk parsing. For all other source types — response_body JSON, response_cel, and
+// response_metadata — a synthetic ResponseContext is built from the stream context plus
+// the accumulated bytes, then the existing ExtractResponseCost is called. This reuses
+// the full extraction dispatch (JSONPath, CEL evaluation, metadata lookup) without
+// duplicating any logic.
+//
+// Note: response headers are already committed to the client before the first chunk
+// arrives, so rate-limit headers cannot be updated here. The pre-request availability
+// check in OnRequestHeaders still blocks requests when the quota is fully exhausted.
+func (p *RateLimitPolicy) finalizeAndConsumeStreamingCosts(
+	ctx context.Context,
+	respCtx *policy.ResponseStreamContext,
+	state map[string]*streamQuotaState,
+) {
+	// quotaKeys were written to metadata during the request phase (OnRequestHeaders /
+	// OnRequestBody) and carry the rate-limit key for each quota into the response phase.
+	quotaKeys, _ := respCtx.Metadata[rateLimitKeysKey].(map[string]string)
+
+	for i := range p.quotas {
+		q := &p.quotas[i]
+		if !q.CostExtractionEnabled || q.CostExtractor == nil {
+			continue
+		}
+		// Only process quotas with non-header response sources. response_header quotas
+		// are fully consumed in OnResponseHeaders and must not be charged again.
+		if !p.hasStreamingResponseSourceForQuota(q) {
+			continue
+		}
+
+		quotaName := quotaNameFor(q, i)
+		key := quotaKeys[quotaName]
+		qs := state[quotaName]
+
+		var (
+			actualCost float64
+			extracted  bool
+		)
+
+		if qs != nil && qs.isSSE != nil && *qs.isSSE && qs.found {
+			// SSE response_body: cost was extracted per-chunk; use it directly.
+			// There is no accumulated body to parse — the per-chunk path is authoritative.
+			actualCost = qs.lastCost
+			extracted = true
+		} else {
+			// JSON response_body, response_cel, response_metadata:
+			// Build a synthetic ResponseContext so that ExtractResponseCost can dispatch
+			// to the correct handler for each source type without duplicating logic here.
+			//
+			// ResponseBody.Content holds the bytes accumulated across all chunks.
+			// For response_metadata, Content will be empty — ExtractResponseCost reads
+			// from synthCtx.Metadata (which is the shared SharedContext.Metadata already
+			// populated by upstream policies during the stream).
+			bodyBytes := []byte(nil)
+			if qs != nil {
+				bodyBytes = qs.accumulated
+			}
+			synthCtx := &policy.ResponseContext{
+				SharedContext:   respCtx.SharedContext,
+				RequestHeaders:  respCtx.RequestHeaders,
+				RequestBody:     respCtx.RequestBody,
+				RequestPath:     respCtx.RequestPath,
+				RequestMethod:   respCtx.RequestMethod,
+				ResponseHeaders: respCtx.ResponseHeaders,
+				ResponseStatus:  respCtx.ResponseStatus,
+				ResponseBody: &policy.Body{
+					Content:     bodyBytes,
+					Present:     len(bodyBytes) > 0,
+					EndOfStream: true,
+				},
+			}
+			actualCost, extracted = q.CostExtractor.ExtractResponseCost(synthCtx)
+			if !extracted {
+				slog.Debug("Streaming EOS cost extraction failed, using default",
+					"quota", quotaName, "key", key, "default", actualCost)
+			}
+		}
+
+		if actualCost < 0 {
+			actualCost = 0
+		}
+		if actualCost == 0 {
+			// Zero cost: skip the limiter call entirely to avoid unnecessary overhead.
+			continue
+		}
+
+		// Consume tokens against the limiter.
+		// ConsumeN (CostTracker) tracks overflow and consumed metrics accurately.
+		// ConsumeOrClampN is the safe fallback for limiters that do not implement
+		// CostTracker; it clamps the deduction to the available balance.
+		if tracker, ok := q.Limiter.(limiter.CostTracker); ok {
+			if _, err := tracker.ConsumeN(ctx, key, int64(actualCost)); err != nil {
+				if p.backend == "redis" && p.redisFailOpen {
+					slog.Warn("Streaming EOS cost consumption failed (fail-open)",
+						"error", err, "quota", quotaName, "key", key, "cost", actualCost)
+					continue
+				}
+				slog.Error("Streaming EOS cost consumption failed (fail-closed)",
+					"error", err, "quota", quotaName, "key", key, "cost", actualCost)
+				continue
+			}
+		} else {
+			if _, err := q.Limiter.ConsumeOrClampN(ctx, key, int64(actualCost)); err != nil {
+				if p.backend == "redis" && p.redisFailOpen {
+					slog.Warn("Streaming EOS cost consumption failed (fail-open)",
+						"error", err, "quota", quotaName, "key", key, "cost", actualCost)
+					continue
+				}
+				slog.Error("Streaming EOS cost consumption failed (fail-closed)",
+					"error", err, "quota", quotaName, "key", key, "cost", actualCost)
+				continue
+			}
+		}
+
+		slog.Debug("Streaming EOS cost consumed",
+			"quota", quotaName,
+			"key", key,
+			"cost", actualCost,
+			"isSSE", qs != nil && qs.isSSE != nil && *qs.isSSE)
+	}
 }
