@@ -20,6 +20,7 @@ package llmcostratelimit
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -424,5 +425,111 @@ func TestLLMCostRateLimitPolicy_Integration_NoBudgetLimits(t *testing.T) {
 
 	if _, ok := action.(policy.UpstreamRequestHeaderModifications); !ok {
 		t.Errorf("Expected UpstreamRequestHeaderModifications when no budget limits configured, got %T", action)
+	}
+}
+
+// stubCostChunkPolicer is a minimal delegate stub that records OnResponseBodyChunk calls.
+type stubCostChunkPolicer struct {
+	chunkCalls int
+}
+
+func (s *stubCostChunkPolicer) Mode() policy.ProcessingMode { return policy.ProcessingMode{} }
+func (s *stubCostChunkPolicer) OnRequestHeaders(context.Context, *policy.RequestHeaderContext, map[string]interface{}) policy.RequestHeaderAction {
+	return nil
+}
+func (s *stubCostChunkPolicer) OnResponseHeaders(context.Context, *policy.ResponseHeaderContext, map[string]interface{}) policy.ResponseHeaderAction {
+	return nil
+}
+func (s *stubCostChunkPolicer) OnResponseBody(context.Context, *policy.ResponseContext, map[string]interface{}) policy.ResponseAction {
+	return nil
+}
+func (s *stubCostChunkPolicer) OnResponseBodyChunk(_ context.Context, _ *policy.ResponseStreamContext, _ *policy.StreamBody, _ map[string]interface{}) policy.ResponseChunkAction {
+	s.chunkCalls++
+	return policy.ResponseChunkAction{}
+}
+func (s *stubCostChunkPolicer) NeedsMoreResponseData(_ []byte) bool { return false }
+
+func newCostStreamCtx(providerName string, pinnedDelegate policy.Policy) *policy.ResponseStreamContext {
+	metadata := map[string]interface{}{}
+	if providerName != "" {
+		metadata[MetadataKeyProviderName] = providerName
+	}
+	if pinnedDelegate != nil {
+		metadata[MetadataKeyDelegate] = pinnedDelegate
+	}
+	return &policy.ResponseStreamContext{
+		SharedContext: &policy.SharedContext{
+			Metadata: metadata,
+		},
+		ResponseHeaders: policy.NewHeaders(map[string][]string{}),
+	}
+}
+
+// TestLLMCostRateLimitPolicy_Mode_ReturnsStream verifies that Mode reports BodyModeStream.
+func TestLLMCostRateLimitPolicy_Mode_ReturnsStream(t *testing.T) {
+	p := &LLMCostRateLimitPolicy{}
+	mode := p.Mode()
+	if mode.ResponseBodyMode != policy.BodyModeStream {
+		t.Errorf("expected ResponseBodyMode=BodyModeStream, got %v", mode.ResponseBodyMode)
+	}
+}
+
+// TestLLMCostRateLimitPolicy_NeedsMoreResponseData_ReturnsFalse verifies the streaming
+// buffer hint is always false (metadata is read at EOS, no buffering needed).
+func TestLLMCostRateLimitPolicy_NeedsMoreResponseData_ReturnsFalse(t *testing.T) {
+	p := &LLMCostRateLimitPolicy{}
+	if p.NeedsMoreResponseData([]byte("anything")) {
+		t.Error("expected NeedsMoreResponseData to return false")
+	}
+}
+
+// TestLLMCostRateLimitPolicy_OnResponseBodyChunk_NoProvider verifies that a missing
+// provider name and no pinned delegate is handled gracefully.
+func TestLLMCostRateLimitPolicy_OnResponseBodyChunk_NoProvider(t *testing.T) {
+	p := &LLMCostRateLimitPolicy{metadata: policy.PolicyMetadata{RouteName: "r"}}
+	respCtx := newCostStreamCtx("", nil)
+	chunk := &policy.StreamBody{Chunk: []byte("data: {}"), EndOfStream: true}
+
+	action := p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
+	if !reflect.DeepEqual(action, policy.ResponseChunkAction{}) {
+		t.Errorf("expected empty ResponseChunkAction, got %v", action)
+	}
+}
+
+// TestLLMCostRateLimitPolicy_OnResponseBodyChunk_UsesPinnedDelegate verifies that the
+// delegate pinned in metadata during OnRequestHeaders takes precedence.
+func TestLLMCostRateLimitPolicy_OnResponseBodyChunk_UsesPinnedDelegate(t *testing.T) {
+	stub := &stubCostChunkPolicer{}
+	p := &LLMCostRateLimitPolicy{metadata: policy.PolicyMetadata{RouteName: "r"}}
+	respCtx := newCostStreamCtx("", stub)
+
+	chunks := [][]byte{
+		[]byte("data: {\"usage\":{}}\n"),
+		[]byte("data: [DONE]\n"),
+	}
+	for i, c := range chunks {
+		eos := i == len(chunks)-1
+		p.OnResponseBodyChunk(context.Background(), respCtx, &policy.StreamBody{Chunk: c, EndOfStream: eos, Index: uint64(i)}, nil)
+	}
+
+	if stub.chunkCalls != 2 {
+		t.Errorf("expected pinned delegate OnResponseBodyChunk called 2 times, got %d", stub.chunkCalls)
+	}
+}
+
+// TestLLMCostRateLimitPolicy_OnResponseBodyChunk_FallsBackToDelegatesMap verifies the
+// fallback lookup by provider name when no delegate is pinned in metadata.
+func TestLLMCostRateLimitPolicy_OnResponseBodyChunk_FallsBackToDelegatesMap(t *testing.T) {
+	stub := &stubCostChunkPolicer{}
+	p := &LLMCostRateLimitPolicy{metadata: policy.PolicyMetadata{RouteName: "r"}}
+	p.delegates.Store("anthropic", &delegateEntry{cacheKey: "k", delegate: stub})
+
+	respCtx := newCostStreamCtx("anthropic", nil)
+	chunk := &policy.StreamBody{Chunk: []byte("data: [DONE]\n"), EndOfStream: true}
+
+	p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
+
+	if stub.chunkCalls != 1 {
+		t.Errorf("expected delegate OnResponseBodyChunk called 1 time via fallback, got %d", stub.chunkCalls)
 	}
 }

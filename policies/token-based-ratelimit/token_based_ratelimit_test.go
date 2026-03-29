@@ -19,10 +19,46 @@
 package tokenbasedratelimit
 
 import (
+	"context"
+	"reflect"
 	"testing"
 
 	policy "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 )
+
+// stubChunkPolicer is a minimal delegate stub that records chunk calls.
+type stubChunkPolicer struct {
+	chunkCalls int
+}
+
+func (s *stubChunkPolicer) Mode() policy.ProcessingMode { return policy.ProcessingMode{} }
+func (s *stubChunkPolicer) OnRequestHeaders(context.Context, *policy.RequestHeaderContext, map[string]interface{}) policy.RequestHeaderAction {
+	return nil
+}
+func (s *stubChunkPolicer) OnResponseHeaders(context.Context, *policy.ResponseHeaderContext, map[string]interface{}) policy.ResponseHeaderAction {
+	return nil
+}
+func (s *stubChunkPolicer) OnResponseBody(context.Context, *policy.ResponseContext, map[string]interface{}) policy.ResponseAction {
+	return nil
+}
+func (s *stubChunkPolicer) OnResponseBodyChunk(_ context.Context, _ *policy.ResponseStreamContext, _ *policy.StreamBody, _ map[string]interface{}) policy.ResponseChunkAction {
+	s.chunkCalls++
+	return policy.ResponseChunkAction{}
+}
+func (s *stubChunkPolicer) NeedsMoreResponseData(_ []byte) bool { return false }
+
+func newTokenStreamCtx(providerName string) *policy.ResponseStreamContext {
+	metadata := map[string]interface{}{}
+	if providerName != "" {
+		metadata[MetadataKeyProviderName] = providerName
+	}
+	return &policy.ResponseStreamContext{
+		SharedContext: &policy.SharedContext{
+			Metadata: metadata,
+		},
+		ResponseHeaders: policy.NewHeaders(map[string][]string{}),
+	}
+}
 
 // TestTokenBasedRateLimitPolicy_GetPolicy tests policy creation
 func TestTokenBasedRateLimitPolicy_GetPolicy(t *testing.T) {
@@ -371,5 +407,72 @@ func TestTokenBasedRateLimitPolicy_TransformToRatelimitParams_TemplateLocationMa
 	totalSource := getSource("total_tokens")
 	if totalSource["type"] != "metadata" || totalSource["key"] != "usage.total_tokens" {
 		t.Fatalf("Unexpected total source mapping: %v", totalSource)
+	}
+}
+
+// TestTokenBasedRateLimitPolicy_Mode_ReturnsStream verifies that Mode reports BodyModeStream.
+func TestTokenBasedRateLimitPolicy_Mode_ReturnsStream(t *testing.T) {
+	p := &TokenBasedRateLimitPolicy{}
+	mode := p.Mode()
+	if mode.ResponseBodyMode != policy.BodyModeStream {
+		t.Errorf("expected ResponseBodyMode=BodyModeStream, got %v", mode.ResponseBodyMode)
+	}
+}
+
+// TestTokenBasedRateLimitPolicy_NeedsMoreResponseData_ReturnsFalse verifies the streaming
+// buffer hint is always false (the delegate manages its own accumulation).
+func TestTokenBasedRateLimitPolicy_NeedsMoreResponseData_ReturnsFalse(t *testing.T) {
+	p := &TokenBasedRateLimitPolicy{}
+	if p.NeedsMoreResponseData([]byte("data: hello")) {
+		t.Error("expected NeedsMoreResponseData to return false")
+	}
+}
+
+// TestTokenBasedRateLimitPolicy_OnResponseBodyChunk_NoProvider verifies that a missing
+// provider name in metadata is handled gracefully without panic.
+func TestTokenBasedRateLimitPolicy_OnResponseBodyChunk_NoProvider(t *testing.T) {
+	p := &TokenBasedRateLimitPolicy{metadata: policy.PolicyMetadata{RouteName: "r"}}
+	respCtx := newTokenStreamCtx("")
+	chunk := &policy.StreamBody{Chunk: []byte("data: {}"), EndOfStream: true}
+
+	action := p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
+	if !reflect.DeepEqual(action, policy.ResponseChunkAction{}) {
+		t.Errorf("expected empty ResponseChunkAction, got %v", action)
+	}
+}
+
+// TestTokenBasedRateLimitPolicy_OnResponseBodyChunk_NoDelegateFound verifies that a
+// provider name with no cached delegate is handled gracefully.
+func TestTokenBasedRateLimitPolicy_OnResponseBodyChunk_NoDelegateFound(t *testing.T) {
+	p := &TokenBasedRateLimitPolicy{metadata: policy.PolicyMetadata{RouteName: "r"}}
+	respCtx := newTokenStreamCtx("unknown-provider")
+	chunk := &policy.StreamBody{Chunk: []byte("data: {}"), EndOfStream: true}
+
+	action := p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
+	if !reflect.DeepEqual(action, policy.ResponseChunkAction{}) {
+		t.Errorf("expected empty ResponseChunkAction, got %v", action)
+	}
+}
+
+// TestTokenBasedRateLimitPolicy_OnResponseBodyChunk_DelegateCalled verifies that
+// OnResponseBodyChunk forwards to the cached delegate when one exists.
+func TestTokenBasedRateLimitPolicy_OnResponseBodyChunk_DelegateCalled(t *testing.T) {
+	stub := &stubChunkPolicer{}
+	p := &TokenBasedRateLimitPolicy{metadata: policy.PolicyMetadata{RouteName: "r"}}
+	p.delegates.Store("openai", stub)
+
+	respCtx := newTokenStreamCtx("openai")
+	chunks := [][]byte{
+		[]byte("data: {\"usage\":{\"total_tokens\":50}}\n"),
+		[]byte("data: [DONE]\n"),
+	}
+
+	for i, c := range chunks {
+		eos := i == len(chunks)-1
+		p.OnResponseBodyChunk(context.Background(), respCtx, &policy.StreamBody{Chunk: c, EndOfStream: eos, Index: uint64(i)}, nil)
+	}
+
+	if stub.chunkCalls != 2 {
+		t.Errorf("expected delegate OnResponseBodyChunk called 2 times, got %d", stub.chunkCalls)
 	}
 }

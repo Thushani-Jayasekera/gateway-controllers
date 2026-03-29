@@ -64,7 +64,7 @@ func (p *TokenBasedRateLimitPolicy) Mode() policy.ProcessingMode {
 		RequestHeaderMode:  policy.HeaderModeProcess,
 		RequestBodyMode:    policy.BodyModeSkip,
 		ResponseHeaderMode: policy.HeaderModeProcess,
-		ResponseBodyMode:   policy.BodyModeBuffer,
+		ResponseBodyMode:   policy.BodyModeStream,
 	}
 }
 
@@ -464,6 +464,42 @@ func (p *TokenBasedRateLimitPolicy) OnResponseHeaders(ctx context.Context, respC
 	}
 
 	return policy.DownstreamResponseHeaderModifications{}
+}
+
+// OnResponseBodyChunk processes each streaming response chunk by delegating to the
+// provider-specific advanced-ratelimit instance. The delegate accumulates SSE or JSON
+// chunks and consumes the token quota at end-of-stream.
+func (p *TokenBasedRateLimitPolicy) OnResponseBodyChunk(
+	ctx context.Context,
+	respCtx *policy.ResponseStreamContext,
+	chunk *policy.StreamBody,
+	params map[string]interface{},
+) policy.ResponseChunkAction {
+	type responseChunkPolicer interface {
+		OnResponseBodyChunk(context.Context, *policy.ResponseStreamContext, *policy.StreamBody, map[string]interface{}) policy.ResponseChunkAction
+	}
+
+	providerName, ok := respCtx.Metadata[MetadataKeyProviderName].(string)
+	if !ok || providerName == "" {
+		slog.Debug("OnResponseBodyChunk: provider name not found in metadata; skipping",
+			"route", p.metadata.RouteName)
+		return policy.ResponseChunkAction{}
+	}
+
+	if delegate, ok := p.delegates.Load(providerName); ok {
+		if rl, ok := delegate.(responseChunkPolicer); ok {
+			return rl.OnResponseBodyChunk(ctx, respCtx, chunk, params)
+		}
+	}
+
+	return policy.ResponseChunkAction{}
+}
+
+// NeedsMoreResponseData returns false because the delegate (advanced-ratelimit) manages
+// all buffering internally — SSE costs are extracted per-chunk and JSON bytes are
+// accumulated in the delegate's per-request stream state.
+func (p *TokenBasedRateLimitPolicy) NeedsMoreResponseData(_ []byte) bool {
+	return false
 }
 
 // OnResponseBody processes the response body phase by delegating to the provider-specific instance.
