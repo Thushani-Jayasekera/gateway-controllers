@@ -47,7 +47,8 @@ const (
 	sseDone                  = "[DONE]"
 	sseEventPrefix           = "event:"
 	DefaultStreamingJsonPath = "$.choices[0].delta.content"
-	metaKeyAccJsonBody       = "urlguardrail:json_body"
+	metaKeyAccJsonBody = "urlguardrail:json_body"
+	metaKeyViolated   = "urlguardrail:violated"
 )
 
 var (
@@ -58,7 +59,13 @@ var (
 	// way through a URL body that has started past "://" but has no terminating
 	// whitespace yet ("https://example.com/path"). A single regex covers both
 	// cases: https?  optionally followed by  :  and any non-whitespace chars.
-	incompleteURLAtEnd = regexp.MustCompile(`(?:^|[\s])https?(?::[^\s]*)?$`)
+	//
+	// [^\w] (instead of [\s]) is intentional: URLs can appear directly after
+	// non-whitespace punctuation such as backticks, parentheses, or quotes
+	// (e.g. `http://example.com`).  Using [^\w] accepts any non-alphanumeric
+	// predecessor while still rejecting embedded substrings like "webhttps"
+	// where a word character (b) immediately precedes the protocol.
+	incompleteURLAtEnd = regexp.MustCompile(`(?:^|[^\w])https?(?::[^\s]*)?$`)
 )
 
 // URLGuardrailPolicy implements URL validation guardrail
@@ -487,14 +494,26 @@ func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *p
 		return policy.ResponseChunkAction{}
 	}
 
+	if respCtx.Metadata == nil {
+		respCtx.Metadata = make(map[string]interface{})
+	}
+	// Violation already reported — suppress all subsequent chunks so the client
+	// does not receive real content after the error + [DONE] we already sent.
+	if violated, _ := respCtx.Metadata[metaKeyViolated].(bool); violated {
+		return policy.ResponseChunkAction{Body: []byte{}}
+	}
+
 	chunkStr := string(chunk.Chunk)
+
+	// If a preceding policy already emitted a guardrail SSE error event, pass it
+	// through unchanged — a second guardrail must not validate or override it.
+	if isGuardrailSSEErrorEvent(chunkStr) {
+		return policy.ResponseChunkAction{}
+	}
 
 	if !isSSEChunk(chunkStr) {
 		// Plain JSON via chunked transfer (e.g. OpenAI stream:false with Transfer-Encoding: chunked).
 		// Accumulate all chunks and validate the complete body at end of stream.
-		if respCtx.Metadata == nil {
-			respCtx.Metadata = make(map[string]interface{})
-		}
 		prev, _ := respCtx.Metadata[metaKeyAccJsonBody].(string)
 		full := prev + chunkStr
 		respCtx.Metadata[metaKeyAccJsonBody] = full
@@ -533,12 +552,37 @@ func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *p
 	if len(invalidURLs) > 0 {
 		slog.Debug("URLGuardrail: streaming validation failed",
 			"invalidURLCount", len(invalidURLs), "totalURLCount", len(urls))
-		return policy.ResponseChunkAction{
-			Body: p.buildSSEErrorEvent(invalidURLs, p.responseParams.ShowAssessment),
-		}
+		respCtx.Metadata[metaKeyViolated] = true
+		errorEvent := p.buildSSEErrorEvent(invalidURLs, p.responseParams.ShowAssessment)
+		done := []byte(sseDataPrefix + sseDone + "\n\n")
+		return policy.ResponseChunkAction{Body: append(errorEvent, done...)}
 	}
 
 	return policy.ResponseChunkAction{} // all URLs valid — pass through
+}
+
+// isGuardrailSSEErrorEvent returns true when the chunk is a guardrail SSE error
+// event emitted by a preceding policy in the chain. Such a chunk has an SSE
+// data line whose JSON payload carries a "type" field ending with "_GUARDRAIL".
+// These chunks must be passed through unchanged so the upstream error is
+// preserved and not overwritten by a subsequent guardrail.
+func isGuardrailSSEErrorEvent(s string) bool {
+	for _, line := range strings.SplitN(s, "\n", 5) {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, sseDataPrefix) {
+			continue
+		}
+		data := strings.TrimPrefix(line, sseDataPrefix)
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(data), &m) != nil {
+			continue
+		}
+		msg, _ := m["message"].(map[string]interface{})
+		if msg["action"] == "GUARDRAIL_INTERVENED" {
+			return true
+		}
+	}
+	return false
 }
 
 // isSSEChunk reports whether s looks like SSE data (has at least one "data: " or "event:" line).
