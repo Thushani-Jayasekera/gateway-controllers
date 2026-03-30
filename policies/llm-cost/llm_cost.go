@@ -31,6 +31,11 @@ const (
 	sseDataPrefix  = "data: "
 	sseDone        = "[DONE]"
 	sseEventPrefix = "event:"
+
+	// llmCostStreamAccumKey is the per-request metadata key used to accumulate
+	// streaming response body chunks. It is written by OnResponseBodyChunk and
+	// deleted at end-of-stream once the cost has been calculated.
+	llmCostStreamAccumKey = "llm-cost:stream-accum"
 )
 
 const (
@@ -85,13 +90,19 @@ func GetPolicy(
 // Mode declares the SDK processing requirements:
 //   - RequestBodyMode=Buffer: buffer the request so ctx.RequestBody is available
 //     in OnResponseBody (needed for Anthropic speed parameter).
-//   - ResponseBodyMode=Buffer: buffer the full response body so we can parse
-//     the usage object and model name.
+//   - ResponseBodyMode=Stream: receive body data via OnResponseBodyChunk for both
+//     streaming (SSE) and buffered responses. Chunks are accumulated and processed
+//     at end-of-stream, which covers the buffered path too (single chunk, EOS=true).
 func (p *LLMCostPolicy) Mode() policy.ProcessingMode {
 	return policy.ProcessingMode{
 		RequestBodyMode:  policy.BodyModeBuffer,
-		ResponseBodyMode: policy.BodyModeBuffer,
+		ResponseBodyMode: policy.BodyModeStream,
 	}
+}
+
+// NeedsMoreResponseData always returns false; the policy accumulates chunks manually.
+func (p *LLMCostPolicy) NeedsMoreResponseData(_ []byte) bool {
+	return false
 }
 
 // OnResponseBody reads the LLM response, looks up model pricing, calculates cost,
@@ -186,6 +197,138 @@ func (p *LLMCostPolicy) OnResponseBody(ctx context.Context, respCtx *policy.Resp
 	)
 
 	return setCostMetadata(respCtx, finalCost, costStatusCalculated)
+}
+
+// OnResponseBodyChunk accumulates streaming response chunks and, at end-of-stream,
+// computes the LLM cost and writes it to SharedContext.Metadata so that downstream
+// policies (e.g. llm-cost-based-ratelimit) can read x-llm-cost at EOS.
+// This method is called for both SSE streaming responses and buffered responses
+// (the kernel delivers the full body as a single chunk with EndOfStream=true).
+func (p *LLMCostPolicy) OnResponseBodyChunk(
+	_ context.Context,
+	respCtx *policy.ResponseStreamContext,
+	chunk *policy.StreamBody,
+	_ map[string]interface{},
+) policy.ResponseChunkAction {
+	if len(chunk.Chunk) > 0 {
+		if respCtx.Metadata == nil {
+			respCtx.Metadata = make(map[string]interface{})
+		}
+		existing, _ := respCtx.Metadata[llmCostStreamAccumKey].([]byte)
+		respCtx.Metadata[llmCostStreamAccumKey] = append(existing, chunk.Chunk...)
+	}
+
+	if !chunk.EndOfStream {
+		return policy.ResponseChunkAction{}
+	}
+
+	// EOS: extract accumulated bytes and clean up the temporary key.
+	var accumulated []byte
+	if respCtx.Metadata != nil {
+		accumulated, _ = respCtx.Metadata[llmCostStreamAccumKey].([]byte)
+		delete(respCtx.Metadata, llmCostStreamAccumKey)
+	}
+
+	var requestBody []byte
+	if respCtx.RequestBody != nil && respCtx.RequestBody.Present {
+		requestBody = respCtx.RequestBody.Content
+	}
+
+	p.computeAndSetStreamingCost(respCtx.SharedContext, accumulated, requestBody)
+	return policy.ResponseChunkAction{}
+}
+
+// computeAndSetStreamingCost parses the accumulated response bytes, calculates the
+// LLM cost, and writes x-llm-cost / x-llm-cost-status into SharedContext.Metadata.
+func (p *LLMCostPolicy) computeAndSetStreamingCost(sharedCtx *policy.SharedContext, body, requestBody []byte) {
+	if sharedCtx == nil {
+		slog.Warn("llm-cost: SharedContext is nil in streaming mode, cannot set cost metadata")
+		return
+	}
+	if sharedCtx.Metadata == nil {
+		sharedCtx.Metadata = make(map[string]interface{})
+	}
+
+	setMeta := func(cost float64, status string) {
+		sharedCtx.Metadata[MetadataLLMCost] = fmt.Sprintf("%.10f", cost)
+		sharedCtx.Metadata[MetadataLLMCostStatus] = status
+	}
+
+	if len(body) == 0 {
+		slog.Warn("llm-cost: empty accumulated stream body, skipping cost calculation")
+		setMeta(0.0, costStatusNotCalculated)
+		return
+	}
+
+	responseBody := body
+	if isSSEContent(body) {
+		merged, err := mergeSSEEvents(body)
+		if err != nil {
+			slog.Warn("llm-cost: failed to merge SSE events in streaming mode", "error", err)
+			setMeta(0.0, costStatusNotCalculated)
+			return
+		}
+		responseBody = merged
+	}
+
+	var probe struct {
+		Model        string `json:"model"`
+		ModelVersion string `json:"modelVersion"`
+		Message      *struct {
+			Model string `json:"model"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(responseBody, &probe); err != nil {
+		slog.Warn("llm-cost: could not parse streaming response body", "error", err)
+		setMeta(0.0, costStatusNotCalculated)
+		return
+	}
+	modelName := probe.Model
+	if modelName == "" {
+		modelName = probe.ModelVersion
+	}
+	if modelName == "" && probe.Message != nil {
+		modelName = probe.Message.Model
+	}
+	if modelName == "" {
+		slog.Warn("llm-cost: no model name found in streaming response body")
+		setMeta(0.0, costStatusNotCalculated)
+		return
+	}
+
+	pricing, found := lookupPricing(p.pricingMap, modelName)
+	if !found {
+		slog.Warn("llm-cost: no pricing entry for model, setting cost to 0", "model", modelName)
+		setMeta(0.0, costStatusNotCalculated)
+		return
+	}
+
+	calc := selectCalculator(pricing.Provider)
+	if calc == nil {
+		slog.Warn("llm-cost: unsupported provider in streaming mode", "provider", pricing.Provider, "model", modelName)
+		setMeta(0.0, costStatusNotCalculated)
+		return
+	}
+
+	usage, err := calc.Normalize(responseBody, requestBody)
+	if err != nil {
+		slog.Warn("llm-cost: failed to normalize streaming usage", "model", modelName, "error", err)
+		setMeta(0.0, costStatusNotCalculated)
+		return
+	}
+
+	baseCost := genericCalculateCost(usage, pricing)
+	finalCost := calc.Adjust(baseCost, usage, pricing)
+
+	slog.Debug("llm-cost: calculated streaming cost",
+		"model", modelName,
+		"provider", pricing.Provider,
+		"prompt_tokens", usage.PromptTokens,
+		"completion_tokens", usage.CompletionTokens,
+		"cost_usd", finalCost,
+	)
+
+	setMeta(finalCost, costStatusCalculated)
 }
 
 // isSSEContent reports whether the body looks like buffered SSE data (has at
