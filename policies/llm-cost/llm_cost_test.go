@@ -1822,7 +1822,8 @@ func TestSetStreamCostMetadata_Formatting(t *testing.T) {
 	for _, tc := range cases {
 		ctx := makeStreamResponseContext()
 		action := setStreamCostMetadata(ctx, tc.cost, costStatusCalculated)
-		if action.AnalyticsMetadata == nil {
+		fwd, ok := action.(policy.ForwardResponseChunk)
+		if !ok || fwd.AnalyticsMetadata == nil {
 			t.Fatalf("expected AnalyticsMetadata in ResponseChunkAction")
 		}
 		got, _ := ctx.Metadata[MetadataLLMCost].(string)
@@ -1967,7 +1968,7 @@ func makeStreamResponseContext() *policy.ResponseStreamContext {
 	}
 }
 
-func assertStreamCostMetadata(t *testing.T, respCtx *policy.ResponseStreamContext, action policy.ResponseChunkAction, wantStatus string, wantCost string) {
+func assertStreamCostMetadata(t *testing.T, respCtx *policy.ResponseStreamContext, action policy.StreamingResponseAction, wantStatus string, wantCost string) {
 	t.Helper()
 	gotStatus, _ := respCtx.Metadata[MetadataLLMCostStatus].(string)
 	if gotStatus != wantStatus {
@@ -1981,7 +1982,7 @@ func assertStreamCostMetadata(t *testing.T, respCtx *policy.ResponseStreamContex
 	}
 }
 
-func invokeWithBody(p *LLMCostPolicy, body []byte) (*policy.ResponseStreamContext, policy.ResponseChunkAction) {
+func invokeWithBody(p *LLMCostPolicy, body []byte) (*policy.ResponseStreamContext, policy.StreamingResponseAction) {
 	ctx := makeStreamResponseContext()
 	action := p.OnResponseBodyChunk(context.Background(), ctx, &policy.StreamBody{Chunk: body, EndOfStream: true}, nil)
 	return ctx, action
@@ -2476,9 +2477,9 @@ func TestOnResponseBodyChunk_SSE_NoUsage_NotCalculated(t *testing.T) {
 // sendChunks sends each byte slice as a separate non-EOS OnResponseBodyChunk call,
 // then sends a final EOS chunk (empty body). This is how Envoy delivers data —
 // the last HTTP/2 DATA frame with END_STREAM is often empty.
-func sendChunks(p *LLMCostPolicy, chunks [][]byte) (*policy.ResponseStreamContext, policy.ResponseChunkAction) {
+func sendChunks(p *LLMCostPolicy, chunks [][]byte) (*policy.ResponseStreamContext, policy.StreamingResponseAction) {
 	ctx := makeStreamResponseContext()
-	var action policy.ResponseChunkAction
+	var action policy.StreamingResponseAction
 	for i, c := range chunks {
 		action = p.OnResponseBodyChunk(context.Background(), ctx, &policy.StreamBody{
 			Chunk: c,
@@ -2511,7 +2512,7 @@ func TestOnResponseBodyChunk_SSE_IntermediateChunksDoNotSetCost(t *testing.T) {
 		if _, ok := ctx.Metadata[MetadataLLMCostStatus]; ok {
 			t.Fatalf("chunk %d: cost status set before EndOfStream", i)
 		}
-		if len(action.AnalyticsMetadata) != 0 {
+		if fwd, ok := action.(policy.ForwardResponseChunk); ok && len(fwd.AnalyticsMetadata) != 0 {
 			t.Fatalf("chunk %d: unexpected analytics metadata on intermediate chunk", i)
 		}
 	}

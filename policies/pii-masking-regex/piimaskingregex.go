@@ -508,21 +508,21 @@ func (p *PIIMaskingRegexPolicy) NeedsMoreResponseData(accumulated []byte) bool {
 // LLMs always use Transfer-Encoding: chunked, so this method handles two formats:
 //   - SSE streaming: lines prefixed with "data: ", restores in choices[*].delta.content
 //   - Full JSON (non-streaming, chunked transfer): restores in raw JSON bytes
-func (p *PIIMaskingRegexPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+func (p *PIIMaskingRegexPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.StreamingResponseAction {
 	if p.params.RedactPII {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	if chunk == nil || len(chunk.Chunk) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	maskedPII, exists := respCtx.Metadata[MetadataKeyPIIEntities]
 	if !exists {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	maskedPIIMap, ok := maskedPII.(map[string]string)
 	if !ok || len(maskedPIIMap) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	chunkStr := string(chunk.Chunk)
@@ -533,11 +533,9 @@ func (p *PIIMaskingRegexPolicy) OnResponseBodyChunk(ctx context.Context, respCtx
 
 	// Detect format: SSE responses have lines starting with "data: "
 	if isSSEChunk(chunkStr) {
-		v1result := p.restoreSSEChunk(chunkStr, restoreMap)
-		return policy.ResponseChunkAction{Body: v1result.Body}
+		return p.restoreSSEChunk(chunkStr, restoreMap)
 	}
-	v1result := p.restoreJSONChunk(chunkStr, restoreMap)
-	return policy.ResponseChunkAction{Body: v1result.Body}
+	return p.restoreJSONChunk(chunkStr, restoreMap)
 }
 
 // ─── SSE / Streaming helpers ─────────────────────────────────────────────────
@@ -560,7 +558,7 @@ func isSSEChunk(s string) bool {
 // delta.content values, restore on the full string, then redistribute: the
 // first content-bearing event gets the complete restored text, and all subsequent
 // events whose content has been merged into the first are dropped entirely.
-func (p *PIIMaskingRegexPolicy) restoreSSEChunk(chunkStr string, maskedMap map[string]string) policy.ResponseChunkAction {
+func (p *PIIMaskingRegexPolicy) restoreSSEChunk(chunkStr string, maskedMap map[string]string) policy.ForwardResponseChunk {
 	lines := strings.Split(chunkStr, "\n")
 
 	// Collect every SSE data line that carries a non-empty delta.content.
@@ -583,7 +581,7 @@ func (p *PIIMaskingRegexPolicy) restoreSSEChunk(chunkStr string, maskedMap map[s
 	}
 
 	if len(contentLines) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	// Concatenate fragments and restore in one pass.
@@ -595,7 +593,7 @@ func (p *PIIMaskingRegexPolicy) restoreSSEChunk(chunkStr string, maskedMap map[s
 	restoredContent := restore(fullContent, maskedMap)
 
 	if restoredContent == fullContent {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	// Redistribute: first content-bearing event gets the full restored text;
@@ -620,7 +618,7 @@ func (p *PIIMaskingRegexPolicy) restoreSSEChunk(chunkStr string, maskedMap map[s
 		filtered = append(filtered, line)
 	}
 
-	return policy.ResponseChunkAction{Body: []byte(strings.Join(filtered, "\n"))}
+	return policy.ForwardResponseChunk{Body: []byte(strings.Join(filtered, "\n"))}
 }
 
 // extractFirstDeltaContent parses a single SSE JSON line and returns the
@@ -694,7 +692,7 @@ func updateDeltaContentInLine(line, newContent string) string {
 // restoreJSONChunk handles full JSON responses delivered via chunked transfer encoding.
 // Placeholders are replaced directly in the raw JSON bytes so that key order,
 // whitespace, and any trailing newline from the LLM are preserved exactly.
-func (p *PIIMaskingRegexPolicy) restoreJSONChunk(chunkStr string, maskedMap map[string]string) policy.ResponseChunkAction {
+func (p *PIIMaskingRegexPolicy) restoreJSONChunk(chunkStr string, maskedMap map[string]string) policy.ForwardResponseChunk {
 	result := chunkStr
 	for placeholder, original := range maskedMap {
 		if !strings.Contains(result, placeholder) {
@@ -710,9 +708,9 @@ func (p *PIIMaskingRegexPolicy) restoreJSONChunk(chunkStr string, maskedMap map[
 		result = strings.ReplaceAll(result, placeholder, escapedOriginal)
 	}
 	if result == chunkStr {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
-	return policy.ResponseChunkAction{Body: []byte(result)}
+	return policy.ForwardResponseChunk{Body: []byte(result)}
 }
 
 // restoreInChoices parses a JSON string, restores PII placeholders in

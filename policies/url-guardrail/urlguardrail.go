@@ -479,12 +479,12 @@ func (p *URLGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
 // For plain JSON (chunked transfer): chunks are accumulated until EndOfStream,
 // then validated via JSONPath; on failure the final chunk is replaced with a
 // JSON error body. ImmediateResponse is not available once headers are committed.
-func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, _ map[string]interface{}) policy.ResponseChunkAction {
+func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, _ map[string]interface{}) policy.StreamingResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	if chunk == nil || len(chunk.Chunk) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	chunkStr := string(chunk.Chunk)
@@ -499,13 +499,13 @@ func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *p
 		full := prev + chunkStr
 		respCtx.Metadata[metaKeyAccJsonBody] = full
 		if !chunk.EndOfStream {
-			return policy.ResponseChunkAction{}
+			return policy.ForwardResponseChunk{}
 		}
 		result := p.validatePayload([]byte(full), p.responseParams, true)
 		if mod, ok := result.(policy.DownstreamResponseModifications); ok && mod.StatusCode != nil {
-			return policy.ResponseChunkAction{Body: mod.Body}
+			return policy.TerminateResponseChunk{Body: mod.Body}
 		}
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	content := extractSSEDeltaContent(chunkStr, p.responseParams.StreamingJsonPath)
@@ -514,7 +514,7 @@ func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *p
 
 	urls := urlRegexCompiled.FindAllString(content, -1)
 	if len(urls) == 0 {
-		return policy.ResponseChunkAction{} // no URLs — pass through
+		return policy.ForwardResponseChunk{} // no URLs — pass through
 	}
 
 	invalidURLs := make([]string, 0)
@@ -533,12 +533,12 @@ func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *p
 	if len(invalidURLs) > 0 {
 		slog.Debug("URLGuardrail: streaming validation failed",
 			"invalidURLCount", len(invalidURLs), "totalURLCount", len(urls))
-		return policy.ResponseChunkAction{
+		return policy.ForwardResponseChunk{
 			Body: p.buildSSEErrorEvent(invalidURLs, p.responseParams.ShowAssessment),
 		}
 	}
 
-	return policy.ResponseChunkAction{} // all URLs valid — pass through
+	return policy.ForwardResponseChunk{} // all URLs valid — pass through
 }
 
 // isSSEChunk reports whether s looks like SSE data (has at least one "data: " or "event:" line).

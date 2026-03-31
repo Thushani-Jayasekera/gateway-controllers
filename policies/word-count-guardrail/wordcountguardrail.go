@@ -677,12 +677,12 @@ func (p *WordCountGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) boo
 // OnResponseBodyChunk implements StreamingResponsePolicy.
 // Receives flushed batches from the kernel accumulator and validates them.
 // ctx.Metadata tracks the full accumulated text across windows for accuracy.
-func (p *WordCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+func (p *WordCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.StreamingResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	if chunk == nil || len(chunk.Chunk) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	chunkStr := string(chunk.Chunk)
 	if respCtx.Metadata == nil {
@@ -695,7 +695,7 @@ func (p *WordCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, resp
 		full := prev + chunkStr
 		respCtx.Metadata[metaKeyAccJsonBody] = full
 		if !chunk.EndOfStream {
-			return policy.ResponseChunkAction{}
+			return policy.ForwardResponseChunk{}
 		}
 		// An empty or whitespace-only EndOfStream chunk is a bare sentinel that arrives after
 		// the SSE [DONE] event. All content was already processed by the SSE path, so perform
@@ -707,19 +707,19 @@ func (p *WordCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, resp
 			if !rp.Invert {
 				if count < rp.Min {
 					reason := fmt.Sprintf("word count %d is below minimum of %d words", count, rp.Min)
-					return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+					return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 				}
 			} else if count >= rp.Min && count <= rp.Max {
 				reason := fmt.Sprintf("word count %d is within the excluded range %d-%d words", count, rp.Min, rp.Max)
-				return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+				return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 			}
-			return policy.ResponseChunkAction{}
+			return policy.ForwardResponseChunk{}
 		}
 		result := p.validatePayload([]byte(full), p.responseParams, true)
 		if mod, ok := result.(policy.DownstreamResponseModifications); ok && mod.StatusCode != nil {
-			return policy.ResponseChunkAction{Body: mod.Body}
+			return policy.TerminateResponseChunk{Body: mod.Body}
 		}
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	rp := p.responseParams
@@ -744,15 +744,15 @@ func (p *WordCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, resp
 			slog.Debug("WordCountGuardrail: max exceeded",
 				"count", count, "max", rp.Max, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("word count %d exceeded maximum of %d words", count, rp.Max)
-			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 		}
 		if isDone && count < rp.Min {
 			slog.Debug("WordCountGuardrail: below min at stream end",
 				"count", count, "min", rp.Min, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("word count %d is below minimum of %d words", count, rp.Min)
-			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 		}
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	// Invert mode: at [DONE], check if count falls within the excluded range.
@@ -761,8 +761,8 @@ func (p *WordCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, resp
 			slog.Debug("WordCountGuardrail: invert violation at stream end",
 				"count", count, "min", rp.Min, "max", rp.Max, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("word count %d is within the excluded range %d-%d words", count, rp.Min, rp.Max)
-			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 		}
 	}
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }

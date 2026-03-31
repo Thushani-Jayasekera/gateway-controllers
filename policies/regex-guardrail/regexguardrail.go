@@ -324,12 +324,12 @@ func (p *RegexGuardrailPolicy) NeedsMoreResponseData(accumulated []byte) bool {
 // Validates SSE delta.content against the configured regex pattern,
 // accumulating content across chunks so patterns split across token
 // boundaries are still caught.
-func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.StreamingResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	if chunk == nil || len(chunk.Chunk) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	if respCtx.Metadata == nil {
@@ -344,13 +344,13 @@ func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx 
 		full := prev + chunkStr
 		respCtx.Metadata[metaKeyAccJsonBody] = full
 		if !chunk.EndOfStream {
-			return policy.ResponseChunkAction{}
+			return policy.ForwardResponseChunk{}
 		}
 		result := p.validatePayload([]byte(full), p.responseParams, true)
 		if mod, ok := result.(policy.DownstreamResponseModifications); ok && mod.StatusCode != nil {
-			return policy.ResponseChunkAction{Body: mod.Body}
+			return policy.TerminateResponseChunk{Body: mod.Body}
 		}
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	rp := p.responseParams
@@ -369,7 +369,7 @@ func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx 
 	compiledRegex, err := regexp.Compile(rp.Regex)
 	if err != nil {
 		// Invalid regex — pass through; the buffered path already caught this.
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	matched := compiledRegex.MatchString(accumulated)
@@ -390,10 +390,10 @@ func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx 
 	if violated {
 		slog.Debug("RegexGuardrail: streaming validation failed",
 			"regex", rp.Regex, "invert", rp.Invert, "chunkIndex", chunk.Index)
-		return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(rp)}
+		return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(rp)}
 	}
 
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }
 
 // isSSEChunk reports whether s looks like SSE data (has at least one "data: " or "event:" line).

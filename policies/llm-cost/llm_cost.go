@@ -271,9 +271,9 @@ func (p *LLMCostPolicy) NeedsMoreResponseData(_ []byte) bool {
 // []json.RawMessage in metadata so the first and last events are cheaply
 // accessible at EndOfStream. For plain JSON chunked responses, raw bytes
 // are accumulated as usual.
-func (p *LLMCostPolicy) OnResponseBodyChunk(_ context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, _ map[string]interface{}) policy.ResponseChunkAction {
+func (p *LLMCostPolicy) OnResponseBodyChunk(_ context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, _ map[string]interface{}) policy.StreamingResponseAction {
 	if chunk == nil {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	if respCtx.Metadata == nil {
@@ -298,7 +298,7 @@ func (p *LLMCostPolicy) OnResponseBodyChunk(_ context.Context, respCtx *policy.R
 	}
 
 	if !chunk.EndOfStream {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	// Flush any line fragment buffered from the last chunk (e.g. a stream that ends
@@ -337,7 +337,7 @@ func (p *LLMCostPolicy) OnResponseBodyChunk(_ context.Context, respCtx *policy.R
 //   - Anthropic: first event (message_start) has model + input tokens inside
 //     message envelope; last usage event (message_delta) has output_tokens at
 //     top level → merged into a single body.
-func (p *LLMCostPolicy) calculateCostFromSSE(respCtx *policy.ResponseStreamContext, events []json.RawMessage, requestBody []byte) policy.ResponseChunkAction {
+func (p *LLMCostPolicy) calculateCostFromSSE(respCtx *policy.ResponseStreamContext, events []json.RawMessage, requestBody []byte) policy.StreamingResponseAction {
 	// Model name is always present in the first SSE event for all providers:
 	//   $.model        — OpenAI, Mistral (every chunk)
 	//   $.modelVersion — Gemini (every chunk)
@@ -389,7 +389,7 @@ func (p *LLMCostPolicy) calculateCostFromSSE(respCtx *policy.ResponseStreamConte
 // calculateCostFromBody handles the plain JSON (non-SSE) path at EndOfStream.
 // Extracts the model name from the body, looks up pricing, and delegates to the
 // shared compute path.
-func (p *LLMCostPolicy) calculateCostFromBody(respCtx *policy.ResponseStreamContext, responseBody []byte, requestBody []byte) policy.ResponseChunkAction {
+func (p *LLMCostPolicy) calculateCostFromBody(respCtx *policy.ResponseStreamContext, responseBody []byte, requestBody []byte) policy.StreamingResponseAction {
 	var probe struct {
 		Model        string `json:"model"`
 		ModelVersion string `json:"modelVersion"`
@@ -430,7 +430,7 @@ func (p *LLMCostPolicy) calculateCostFromBody(respCtx *policy.ResponseStreamCont
 
 // computeAndSetCost normalizes usage from responseBody, calculates the final
 // cost, and stores the result in SharedContext.Metadata.
-func (p *LLMCostPolicy) computeAndSetCost(respCtx *policy.ResponseStreamContext, responseBody []byte, requestBody []byte, modelName string, pricing ModelPricing, calc providerCalculator) policy.ResponseChunkAction {
+func (p *LLMCostPolicy) computeAndSetCost(respCtx *policy.ResponseStreamContext, responseBody []byte, requestBody []byte, modelName string, pricing ModelPricing, calc providerCalculator) policy.StreamingResponseAction {
 	usage, err := calc.Normalize(responseBody, requestBody)
 	if err != nil {
 		slog.Warn("llm-cost: failed to normalize usage", "model", modelName, "error", err)
@@ -630,17 +630,17 @@ func buildAnthropicSSEBody(events []json.RawMessage) ([]byte, error) {
 
 // setStreamCostMetadata writes x-llm-cost and x-llm-cost-status into
 // SharedContext.Metadata and returns a ResponseChunkAction with AnalyticsMetadata.
-func setStreamCostMetadata(respCtx *policy.ResponseStreamContext, costUSD float64, status string) policy.ResponseChunkAction {
+func setStreamCostMetadata(respCtx *policy.ResponseStreamContext, costUSD float64, status string) policy.StreamingResponseAction {
 	if respCtx.SharedContext == nil {
 		slog.Warn("llm-cost: SharedContext is nil, cannot set cost metadata")
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	if respCtx.Metadata == nil {
 		respCtx.Metadata = make(map[string]interface{})
 	}
 	respCtx.Metadata[MetadataLLMCost] = fmt.Sprintf("%.10f", costUSD)
 	respCtx.Metadata[MetadataLLMCostStatus] = status
-	return policy.ResponseChunkAction{
+	return policy.ForwardResponseChunk{
 		AnalyticsMetadata: map[string]interface{}{
 			MetadataLLMCost: costUSD,
 		},

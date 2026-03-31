@@ -268,10 +268,10 @@ func (p *LogMessagePolicy) NeedsMoreRequestData(accumulated []byte) bool {
 // OnRequestBodyChunk implements StreamingRequestPolicy.
 // Logs each streaming request chunk as it arrives. The full request body is
 // logged incrementally across chunks rather than buffered into a single record.
-func (p *LogMessagePolicy) OnRequestBodyChunk(ctx context.Context, reqCtx *policy.RequestStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.RequestChunkAction {
+func (p *LogMessagePolicy) OnRequestBodyChunk(ctx context.Context, reqCtx *policy.RequestStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.StreamingRequestAction {
 	config := p.parseFlowConfig(params, "request")
 	if !config.logPayload || chunk == nil || len(chunk.Chunk) == 0 {
-		return policy.RequestChunkAction{}
+		return policy.ForwardRequestChunk{}
 	}
 
 	logRecord := LogRecord{
@@ -283,7 +283,7 @@ func (p *LogMessagePolicy) OnRequestBodyChunk(ctx context.Context, reqCtx *polic
 	}
 	p.logMessage(logRecord)
 
-	return policy.RequestChunkAction{}
+	return policy.ForwardRequestChunk{}
 }
 
 // NeedsMoreResponseData implements StreamingResponsePolicy.
@@ -295,10 +295,10 @@ func (p *LogMessagePolicy) NeedsMoreResponseData(accumulated []byte) bool {
 // OnResponseBodyChunk implements StreamingResponsePolicy.
 // Logs each streaming response chunk as it arrives, providing real-time
 // visibility into SSE token streams without buffering or latency overhead.
-func (p *LogMessagePolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+func (p *LogMessagePolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.StreamingResponseAction {
 	config := p.parseFlowConfig(params, "response")
 	if !config.logPayload || chunk == nil || len(chunk.Chunk) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	logRecord := LogRecord{
@@ -310,7 +310,7 @@ func (p *LogMessagePolicy) OnResponseBodyChunk(ctx context.Context, respCtx *pol
 	}
 	p.logMessage(logRecord)
 
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }
 
 // getRequestID extracts request ID from request headers
