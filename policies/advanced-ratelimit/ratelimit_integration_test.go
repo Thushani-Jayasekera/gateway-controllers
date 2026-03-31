@@ -2792,6 +2792,429 @@ func TestOnResponseBodyChunk_EmptyFirstChunkDeferrsSSEDetection(t *testing.T) {
 	}
 }
 
+func TestOnResponseBodyChunk_MultipleResponseBodySources_Summed(t *testing.T) {
+	// Regression test for the multi-source bug: when a quota has two response_body
+	// sources (e.g. prompt_tokens + completion_tokens), both values must be extracted
+	// and summed. The old per-chunk per-source path overwrote qs.lastCost on each
+	// source, so only the last source's value was charged.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.prompt_tokens", Multiplier: 1},
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.completion_tokens", Multiplier: 1},
+		},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name:                  "tokens",
+			Limiter:               lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-multisource",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "ms-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// OpenAI-style stream: content deltas carry no usage; only the final event does.
+	sendChunks(t, p, respCtx, [][]byte{
+		[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n"),
+		[]byte("data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n"),
+		// Final event: prompt_tokens=25, completion_tokens=50 → expected total=75
+		[]byte("data: {\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":50,\"total_tokens\":75}}\n"),
+		[]byte("data: [DONE]\n"),
+	})
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	// Both sources must be summed: 25 + 50 = 75
+	if lim.lastCost != 75 {
+		t.Fatalf("expected cost=75 (prompt_tokens+completion_tokens), got %d — multi-source accumulation broken", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_MultipleResponseBodySources_WithMultipliers(t *testing.T) {
+	// Two sources with different multipliers: prompt_tokens * 1.0, completion_tokens * 2.0
+	// prompt=25, completion=50 → 25*1 + 50*2 = 125
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.prompt_tokens", Multiplier: 1.0},
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.completion_tokens", Multiplier: 2.0},
+		},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name:                  "tokens",
+			Limiter:               lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-multimul",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "mm-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	sendChunks(t, p, respCtx, [][]byte{
+		[]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n"),
+		[]byte("data: {\"usage\":{\"prompt_tokens\":25,\"completion_tokens\":50,\"total_tokens\":75}}\n"),
+		[]byte("data: [DONE]\n"),
+	})
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	// 25*1 + 50*2 = 125
+	if lim.lastCost != 125 {
+		t.Fatalf("expected cost=125 (25×1 + 50×2), got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_OpenAISSE_ManyChunks(t *testing.T) {
+	// Realistic OpenAI stream: 10 content delta events followed by a usage event
+	// and [DONE]. Verifies that last-match-wins correctly picks the final usage value
+	// even when many intermediate chunks contain no usage field.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.total_tokens", Multiplier: 1},
+		},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name:                  "tokens",
+			Limiter:               lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-many",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "many-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// 10 content-only delta chunks (no usage field), then a usage-only chunk, then [DONE].
+	words := []string{"The", " quick", " brown", " fox", " jumps", " over", " the", " lazy", " dog", "."}
+	chunks := make([][]byte, 0, len(words)+2)
+	for _, w := range words {
+		chunks = append(chunks, []byte(`data: {"id":"chatcmpl-x","choices":[{"delta":{"content":"`+w+`"}}]}`+"\n"))
+	}
+	// Final usage event — prompt_tokens=12, completion_tokens=10, total_tokens=22
+	chunks = append(chunks, []byte("data: {\"id\":\"chatcmpl-x\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":10,\"total_tokens\":22}}\n"))
+	chunks = append(chunks, []byte("data: [DONE]\n"))
+
+	sendChunks(t, p, respCtx, chunks)
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 22 {
+		t.Fatalf("expected cost=22 from final usage event, got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_AnthropicSSE_MultiChunk_SplitAcrossBoundary(t *testing.T) {
+	// Anthropic SSE stream delivered as many small chunks — including a split mid-line —
+	// to verify that byte accumulation correctly reconstructs the body at EOS.
+	// The authoritative usage is in the message_delta event: input_tokens=10, output_tokens=20.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.output_tokens", Multiplier: 1},
+		},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name:                  "tokens",
+			Limiter:               lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-anthropic-split",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "as-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// Split the anthropicSSEBody into individual lines (one chunk per line).
+	// This simulates each SSE event arriving as a separate chunk and exercises
+	// the accumulation path across many boundary crossings.
+	lines := strings.Split(anthropicSSEBody, "\n")
+	chunks := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			chunks = append(chunks, []byte("\n"))
+		} else {
+			chunks = append(chunks, []byte(line+"\n"))
+		}
+	}
+	// Remove trailing empty chunk if present
+	for len(chunks) > 0 && len(chunks[len(chunks)-1]) == 0 {
+		chunks = chunks[:len(chunks)-1]
+	}
+
+	sendChunks(t, p, respCtx, chunks)
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 20 {
+		t.Fatalf("expected cost=20 from message_delta usage.output_tokens, got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_AnthropicSSE_TwoSources_InputPlusOutput(t *testing.T) {
+	// Two response_body sources extracting input and output tokens separately from
+	// the Anthropic message_delta event. Both must be summed: 10 + 20 = 30.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.input_tokens", Multiplier: 1},
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.output_tokens", Multiplier: 1},
+		},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name:                  "tokens",
+			Limiter:               lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-anthropic-both",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "ab-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// Deliver the Anthropic SSE body line-by-line to exercise multi-chunk accumulation.
+	lines := strings.Split(anthropicSSEBody, "\n")
+	chunks := make([][]byte, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			chunks = append(chunks, []byte("\n"))
+		} else {
+			chunks = append(chunks, []byte(line+"\n"))
+		}
+	}
+	for len(chunks) > 0 && len(chunks[len(chunks)-1]) == 0 {
+		chunks = chunks[:len(chunks)-1]
+	}
+
+	sendChunks(t, p, respCtx, chunks)
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	// input_tokens=10 + output_tokens=20 = 30
+	if lim.lastCost != 30 {
+		t.Fatalf("expected cost=30 (input_tokens+output_tokens), got %d — multi-source accumulation broken", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_OpenAISSE_BufferedAndIndividualChunks(t *testing.T) {
+	// Simulates what happens when another policy in the chain returns NeedsMoreData=true:
+	// the kernel buffers several SSE events and delivers them together as one large chunk,
+	// while the remaining events arrive individually. The rate-limit policy must still
+	// extract the correct final usage value from the complete accumulated body.
+	//
+	// Stream layout:
+	//   chunk 0 (buffered — 4 events merged): 4 content delta events
+	//   chunk 1 (individual):                 1 more content delta
+	//   chunk 2 (individual):                 final usage event
+	//   chunk 3 (individual + EOS):           [DONE]
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.total_tokens", Multiplier: 1},
+		},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name:                  "tokens",
+			Limiter:               lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-buffered",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "buf-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// Four events merged into one chunk by the kernel (simulating upstream buffering).
+	buffered := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"The"}}]}`,
+		`data: {"choices":[{"delta":{"content":" quick"}}]}`,
+		`data: {"choices":[{"delta":{"content":" brown"}}]}`,
+		`data: {"choices":[{"delta":{"content":" fox"}}]}`,
+		"",
+	}, "\n")
+
+	sendChunks(t, p, respCtx, [][]byte{
+		[]byte(buffered),                                       // chunk 0: 4 events buffered together
+		[]byte("data: {\"choices\":[{\"delta\":{\"content\":\" jumps\"}}]}\n"), // chunk 1: individual
+		[]byte("data: {\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n"), // chunk 2: usage
+		[]byte("data: [DONE]\n"),                              // chunk 3: EOS
+	})
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 13 {
+		t.Fatalf("expected cost=13 from final usage event, got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_OpenAISSE_BufferedAndIndividual_MultiSource(t *testing.T) {
+	// Same mixed-buffering scenario but with two response_body sources
+	// (prompt_tokens + completion_tokens). Verifies that multi-source summing
+	// is not affected by whether events arrive individually or batched.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.prompt_tokens", Multiplier: 1},
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.completion_tokens", Multiplier: 1},
+		},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name:                  "tokens",
+			Limiter:               lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-buffered-multi",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "bm-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// First two events arrive buffered together; the usage event arrives alone.
+	buffered := "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n"
+
+	sendChunks(t, p, respCtx, [][]byte{
+		[]byte(buffered),
+		// prompt_tokens=30, completion_tokens=45 → expected 30+45=75
+		[]byte("data: {\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":45,\"total_tokens\":75}}\n"),
+		[]byte("data: [DONE]\n"),
+	})
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	if lim.lastCost != 75 {
+		t.Fatalf("expected cost=75 (30+45), got %d", lim.lastCost)
+	}
+}
+
+func TestOnResponseBodyChunk_AnthropicSSE_BufferedEventsWithIndividualUsage(t *testing.T) {
+	// Anthropic stream where the bulk of content events are buffered into one chunk
+	// by an upstream policy, but the authoritative message_delta (with usage) and
+	// message_stop arrive as individual chunks.
+	//
+	// input_tokens=10, output_tokens=20 in the message_delta event.
+	lim := &fakeLimiter{}
+	ce := NewCostExtractor(CostExtractionConfig{
+		Enabled: true,
+		Default: 1,
+		Sources: []CostSource{
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.input_tokens", Multiplier: 1},
+			{Type: CostSourceResponseBody, JSONPath: "$.usage.output_tokens", Multiplier: 1},
+		},
+	})
+	p := &RateLimitPolicy{
+		quotas: []QuotaRuntime{{
+			Name:                  "tokens",
+			Limiter:               lim,
+			Limits:                []LimitConfig{{Limit: 10000, Duration: time.Minute}},
+			CostExtractor:         ce,
+			CostExtractionEnabled: true,
+		}},
+		routeName: "route-anthropic-buffered",
+	}
+
+	meta := map[string]interface{}{
+		rateLimitKeysKey: map[string]string{"tokens": "ab2-key"},
+	}
+	respCtx := newResponseStreamCtx(nil, nil, meta, 200)
+
+	// Chunk 0 (buffered): message_start + content_block_start + two content_block_delta events
+	bufferedStart := "event: message_start\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n" +
+		"\n" +
+		"event: content_block_start\n" +
+		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n" +
+		"\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n" +
+		"\n" +
+		"event: content_block_delta\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n" +
+		"\n"
+
+	// Chunk 1 (individual): the authoritative message_delta with usage
+	messageDelta := "event: message_delta\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}\n" +
+		"\n"
+
+	// Chunk 2 (individual + EOS): message_stop
+	messageStop := "event: message_stop\n" +
+		"data: {\"type\":\"message_stop\"}\n"
+
+	sendChunks(t, p, respCtx, [][]byte{
+		[]byte(bufferedStart),
+		[]byte(messageDelta),
+		[]byte(messageStop),
+	})
+
+	if lim.consumeNCalls != 1 {
+		t.Fatalf("expected ConsumeN called once, got %d", lim.consumeNCalls)
+	}
+	// input_tokens=10 + output_tokens=20 = 30
+	if lim.lastCost != 30 {
+		t.Fatalf("expected cost=30 (input_tokens+output_tokens from message_delta), got %d", lim.lastCost)
+	}
+}
+
 func TestOnResponseBodyChunk_NoCostExtractionEnabled_NoConsume(t *testing.T) {
 	// Quotas without cost extraction enabled must not call ConsumeN.
 	lim := &fakeLimiter{}

@@ -462,12 +462,14 @@ type quotaResult struct {
 // response body is being processed chunk-by-chunk in streaming mode.
 // A separate instance is stored per quota name inside rateLimitStreamStateKey so
 // that multiple quotas on the same request track their state independently.
+//
+// Raw response bytes are accumulated once per chunk (regardless of how many
+// response-phase sources the quota configures) and cost extraction runs once at
+// EOS via ExtractResponseCost. extractFromBodyBytes already handles both plain
+// JSON and SSE bodies transparently, so no per-format or per-source tracking is
+// needed here.
 type streamQuotaState struct {
-	lastCost    float64 // most recently extracted cost value; overwritten on each matching chunk (last-match-wins)
-	found       bool    // true once at least one chunk yielded a value for the configured jsonPath
-	isSSE       *bool   // nil = format not yet determined; set on first non-empty chunk and fixed for the stream lifetime
-	partialLine []byte  // SSE mode: bytes after the last newline in the current chunk, carried forward to the next
-	accumulated []byte  // JSON mode: raw body bytes gathered across all chunks; extracted once at EOS
+	accumulated []byte // raw body bytes gathered across all chunks; extracted once at EOS
 }
 
 // quotaNameFor returns the display/lookup name for a quota.
@@ -2157,17 +2159,12 @@ func (p *RateLimitPolicy) getOrInitStreamState(metadata map[string]interface{}) 
 // OnResponseBodyChunk is called by the kernel for every response body chunk when the
 // chain runs in FULL_DUPLEX_STREAMED mode (every policy returned BodyModeStream).
 //
-// It handles two formats transparently — detection happens on the first non-empty chunk
-// and is fixed for the lifetime of the stream:
-//
-//   - SSE  (data:/event: prefix detected): parse complete lines per chunk using
-//     parseSSEChunk; any bytes after the last newline are held in partialLine and
-//     prepended to the next chunk to guard against payloads split across boundaries.
-//     lastCost is overwritten on each matching event (last-match-wins), so the final
-//     usage value written by the LLM provider is what gets consumed at EOS.
-//
-//   - JSON (no SSE prefix): accumulate raw bytes in streamQuotaState.accumulated
-//     across all chunks; extract the jsonPath value once at EOS.
+// Raw bytes are accumulated once per quota per chunk into streamQuotaState.accumulated.
+// All cost extraction — both plain JSON (JSONPath) and SSE (last-match-wins via the
+// extractFromBodyBytes SSE fallback) — is deferred to EOS inside
+// finalizeAndConsumeStreamingCosts. Accumulating once per quota (rather than once
+// per source) ensures that quotas with multiple response_body/response_cel sources
+// always receive the correct, un-duplicated body bytes.
 //
 // The chunk is always passed through unmodified — this policy only observes the stream.
 // Token consumption happens in finalizeAndConsumeStreamingCosts at EOS.
@@ -2184,63 +2181,20 @@ func (p *RateLimitPolicy) OnResponseBodyChunk(
 		if !q.CostExtractionEnabled || q.CostExtractor == nil {
 			continue
 		}
+		// Only accumulate bytes for quotas that need body content. Quotas whose
+		// sources are exclusively response_header or response_metadata need no
+		// per-chunk work — they are handled in OnResponseHeaders or read directly
+		// from shared metadata at EOS.
+		if !q.CostExtractor.RequiresResponseBody() {
+			continue
+		}
 
 		quotaName := quotaNameFor(q, i)
 		qs := state[quotaName]
-
-		for _, src := range q.CostExtractor.GetConfig().Sources {
-			switch src.Type {
-			case CostSourceResponseBody:
-				// Detect SSE vs JSON on the first non-empty chunk.
-				// SSE streams always open with "data:" or "event:" on the first content line.
-				// Once set, isSSE stays fixed — we do not re-evaluate mid-stream.
-				if qs.isSSE == nil && len(chunk.Chunk) > 0 {
-					trimmed := strings.TrimLeft(string(chunk.Chunk), " \r\n")
-					isSSE := strings.HasPrefix(trimmed, "data:") || strings.HasPrefix(trimmed, "event:")
-					qs.isSSE = &isSSE
-					slog.Debug("Response body format detected",
-						"quota", quotaName, "isSSE", isSSE)
-				}
-
-				if qs.isSSE != nil && *qs.isSSE {
-					// SSE mode: parse this chunk for complete lines.
-					// Prepend any leftover bytes from the previous chunk so that a JSON
-					// payload split across a boundary is always evaluated as a whole line.
-					combined := append(qs.partialLine, chunk.Chunk...)
-					lastCost, found, remaining := parseSSEChunk(combined, src.JSONPath)
-					qs.partialLine = remaining
-					if found {
-						// Overwrite on each match: the provider's final usage event
-						// (which carries the authoritative token count) will be last.
-						qs.lastCost = lastCost * src.Multiplier
-						qs.found = true
-					}
-				} else {
-					// JSON mode: chunked transfer encoding splits the body arbitrarily.
-					// Accumulate all bytes; extraction runs once at EOS.
-					qs.accumulated = append(qs.accumulated, chunk.Chunk...)
-				}
-
-			case CostSourceResponseCEL:
-				// CEL expressions are evaluated against the complete response body,
-				// so we accumulate all bytes here and evaluate once at EOS —
-				// the same strategy as JSON response_body.
-				qs.accumulated = append(qs.accumulated, chunk.Chunk...)
-
-			case CostSourceResponseMetadata:
-				// Metadata is written to SharedContext by upstream policies during the
-				// stream. No per-chunk work is needed; the value is read at EOS from
-				// the synthetic ResponseContext built in finalizeAndConsumeStreamingCosts.
-
-			default:
-				// response_header sources are handled in OnResponseHeaders; skip.
-			}
-		}
-
+		qs.accumulated = append(qs.accumulated, chunk.Chunk...)
 		state[quotaName] = qs
 	}
-	// Persist updated state so the next chunk call sees the latest partialLine /
-	// accumulated bytes / lastCost for each quota.
+	// Persist updated state so the next chunk call sees the accumulated bytes for each quota.
 	respCtx.Metadata[rateLimitStreamStateKey] = state
 
 	// EOS: all chunks have arrived. Finalize JSON extraction (SSE values are
@@ -2253,21 +2207,22 @@ func (p *RateLimitPolicy) OnResponseBodyChunk(
 }
 
 // NeedsMoreResponseData always returns false.
-// For SSE we extract inline per chunk; for JSON we accumulate manually in
-// streamQuotaState.accumulated and extract at EOS. In neither case do we need
-// the kernel to buffer a minimum number of bytes before invoking OnResponseBodyChunk.
+// Raw bytes are accumulated manually in streamQuotaState.accumulated and
+// extracted at EOS. The kernel does not need to buffer a minimum number of
+// bytes before invoking OnResponseBodyChunk.
 func (p *RateLimitPolicy) NeedsMoreResponseData(_ []byte) bool {
 	return false
 }
 
 // finalizeAndConsumeStreamingCosts is called once when chunk.EndOfStream is true.
 //
-// For response_body SSE quotas the cost is already in streamQuotaState.lastCost from
-// per-chunk parsing. For all other source types — response_body JSON, response_cel, and
-// response_metadata — a synthetic ResponseContext is built from the stream context plus
-// the accumulated bytes, then the existing ExtractResponseCost is called. This reuses
-// the full extraction dispatch (JSONPath, CEL evaluation, metadata lookup) without
-// duplicating any logic.
+// A synthetic ResponseContext is built from the stream context plus the bytes
+// accumulated in streamQuotaState.accumulated, then ExtractResponseCost is called for
+// each quota. ExtractResponseCost dispatches to the appropriate handler for each
+// source type (JSONPath, CEL, metadata lookup) and its extractFromBodyBytes helper
+// transparently handles both plain JSON bodies and SSE streams — for SSE it falls back
+// to extractFromSSEBodyBytes which applies last-match-wins semantics over the buffered
+// events, identical to what per-chunk SSE parsing previously achieved.
 //
 // Note: response headers are already committed to the client before the first chunk
 // arrives, so rate-limit headers cannot be updated here. The pre-request availability
@@ -2301,43 +2256,40 @@ func (p *RateLimitPolicy) finalizeAndConsumeStreamingCosts(
 			extracted  bool
 		)
 
-		if qs != nil && qs.isSSE != nil && *qs.isSSE && qs.found {
-			// SSE response_body: cost was extracted per-chunk; use it directly.
-			// There is no accumulated body to parse — the per-chunk path is authoritative.
-			actualCost = qs.lastCost
-			extracted = true
-		} else {
-			// JSON response_body, response_cel, response_metadata:
-			// Build a synthetic ResponseContext so that ExtractResponseCost can dispatch
-			// to the correct handler for each source type without duplicating logic here.
-			//
-			// ResponseBody.Content holds the bytes accumulated across all chunks.
-			// For response_metadata, Content will be empty — ExtractResponseCost reads
-			// from synthCtx.Metadata (which is the shared SharedContext.Metadata already
-			// populated by upstream policies during the stream).
-			bodyBytes := []byte(nil)
-			if qs != nil {
-				bodyBytes = qs.accumulated
-			}
-			synthCtx := &policy.ResponseContext{
-				SharedContext:   respCtx.SharedContext,
-				RequestHeaders:  respCtx.RequestHeaders,
-				RequestBody:     respCtx.RequestBody,
-				RequestPath:     respCtx.RequestPath,
-				RequestMethod:   respCtx.RequestMethod,
-				ResponseHeaders: respCtx.ResponseHeaders,
-				ResponseStatus:  respCtx.ResponseStatus,
-				ResponseBody: &policy.Body{
-					Content:     bodyBytes,
-					Present:     len(bodyBytes) > 0,
-					EndOfStream: true,
-				},
-			}
-			actualCost, extracted = q.CostExtractor.ExtractResponseCost(synthCtx)
-			if !extracted {
-				slog.Debug("Streaming EOS cost extraction failed, using default",
-					"quota", quotaName, "key", key, "default", actualCost)
-			}
+		// Build a synthetic ResponseContext so that ExtractResponseCost can dispatch
+		// to the correct handler for each source type without duplicating logic here.
+		//
+		// ResponseBody.Content holds the bytes accumulated across all chunks.
+		// extractFromBodyBytes (called inside ExtractResponseCost for response_body
+		// sources) tries JSONPath first; if the body is not valid JSON (e.g. SSE
+		// format), it falls back to extractFromSSEBodyBytes which applies
+		// last-match-wins over each buffered data: line — preserving the correct
+		// final usage value from the provider's last usage event.
+		// For response_metadata, Content will be empty — ExtractResponseCost reads
+		// from synthCtx.Metadata (which is the shared SharedContext.Metadata already
+		// populated by upstream policies during the stream).
+		bodyBytes := []byte(nil)
+		if qs != nil {
+			bodyBytes = qs.accumulated
+		}
+		synthCtx := &policy.ResponseContext{
+			SharedContext:   respCtx.SharedContext,
+			RequestHeaders:  respCtx.RequestHeaders,
+			RequestBody:     respCtx.RequestBody,
+			RequestPath:     respCtx.RequestPath,
+			RequestMethod:   respCtx.RequestMethod,
+			ResponseHeaders: respCtx.ResponseHeaders,
+			ResponseStatus:  respCtx.ResponseStatus,
+			ResponseBody: &policy.Body{
+				Content:     bodyBytes,
+				Present:     len(bodyBytes) > 0,
+				EndOfStream: true,
+			},
+		}
+		actualCost, extracted = q.CostExtractor.ExtractResponseCost(synthCtx)
+		if !extracted {
+			slog.Debug("Streaming EOS cost extraction failed, using default",
+				"quota", quotaName, "key", key, "default", actualCost)
 		}
 
 		if actualCost < 0 {
@@ -2379,7 +2331,6 @@ func (p *RateLimitPolicy) finalizeAndConsumeStreamingCosts(
 		slog.Debug("Streaming EOS cost consumed",
 			"quota", quotaName,
 			"key", key,
-			"cost", actualCost,
-			"isSSE", qs != nil && qs.isSSE != nil && *qs.isSSE)
+			"cost", actualCost)
 	}
 }
