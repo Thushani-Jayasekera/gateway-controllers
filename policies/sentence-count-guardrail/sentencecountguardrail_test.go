@@ -651,3 +651,67 @@ func TestOnRequestBodyAndOnResponseBody(t *testing.T) {
 		t.Fatalf("expected response no-op when response.enabled=false, got %T", respDisabled)
 	}
 }
+
+// ─── OnResponseBodyChunk stream-stop tests ───────────────────────────────────
+
+func sseEvent(content string) string {
+	quoted, _ := json.Marshal(content)
+	return `data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":` + string(quoted) + `},"logprobs":null,"finish_reason":null}],"obfuscation":"test"}` + "\n\n"
+}
+
+func newStreamingPolicy(min, max int) *SentenceCountGuardrailPolicy {
+	return &SentenceCountGuardrailPolicy{
+		hasResponseParams: true,
+		responseParams: SentenceCountGuardrailPolicyParams{
+			Enabled:           true,
+			Min:               min,
+			Max:               max,
+			StreamingJsonPath: DefaultStreamingJsonPath,
+		},
+	}
+}
+
+func newStreamingRespCtx() *policy.ResponseStreamContext {
+	return &policy.ResponseStreamContext{SharedContext: &policy.SharedContext{}}
+}
+
+// TestOnResponseBodyChunk_MaxViolation_EmitsErrorAndTerminates verifies that
+// when the accumulated sentence count exceeds max mid-stream, OnResponseBodyChunk
+// returns an SSE error event with TerminateStream set so the engine closes the
+// stream cleanly.
+func TestOnResponseBodyChunk_MaxViolation_EmitsErrorAndTerminates(t *testing.T) {
+	p := newStreamingPolicy(1, 2)
+	ctx := context.Background()
+	respCtx := newStreamingRespCtx()
+
+	// First two sentences (count == max) pass through unmodified.
+	for _, sentence := range []string{"Hello.", " World."} {
+		chunk := &policy.StreamBody{Chunk: []byte(sseEvent(sentence))}
+		got := p.OnResponseBodyChunk(ctx, respCtx, chunk, nil)
+		if got.Body != nil {
+			t.Fatalf("sentence %q: expected passthrough (Body=nil), got %q", sentence, got.Body)
+		}
+	}
+
+	// Third sentence pushes count to 3, exceeding max=2 — must emit error with TerminateStream.
+	chunk := &policy.StreamBody{Chunk: []byte(sseEvent(" Bye."))}
+	got := p.OnResponseBodyChunk(ctx, respCtx, chunk, nil)
+
+	if got.Body == nil {
+		t.Fatal("expected error body on max violation, got nil")
+	}
+	if !got.TerminateStream {
+		t.Fatal("expected TerminateStream=true on max violation")
+	}
+	if !strings.Contains(string(got.Body), "SENTENCE_COUNT_GUARDRAIL") {
+		t.Fatalf("expected SENTENCE_COUNT_GUARDRAIL in error body, got: %s", got.Body)
+	}
+	// Parse the SSE event and verify guardrail action fields.
+	msg := mustMessageMap(t, []byte(strings.TrimPrefix(strings.TrimSuffix(string(got.Body), "\n\n"), "data: ")))
+	if msg["action"] != "GUARDRAIL_INTERVENED" {
+		t.Fatalf("expected action=GUARDRAIL_INTERVENED, got %#v", msg["action"])
+	}
+	if msg["interveningGuardrail"] != "sentence-count-guardrail" {
+		t.Fatalf("expected interveningGuardrail=sentence-count-guardrail, got %#v", msg["interveningGuardrail"])
+	}
+}

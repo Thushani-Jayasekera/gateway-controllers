@@ -481,3 +481,85 @@ func TestOnRequestBodyAndOnResponseBody(t *testing.T) {
 		t.Fatalf("expected response no-op when response.enabled=false, got %T", respDisabled)
 	}
 }
+
+// ─── OnResponseBodyChunk non-SSE (plain JSON chunked transfer) tests ─────────
+
+// TestOnResponseBodyChunk_NonSSE_InvalidURL_ReturnsError verifies that the
+// non-SSE path correctly detects and blocks invalid URLs when JSONPath extraction
+// succeeds and the extracted text contains an unreachable URL.
+func TestOnResponseBodyChunk_NonSSE_InvalidURL_ReturnsError(t *testing.T) {
+	p := newStreamingURLPolicy(200)
+	ctx := context.Background()
+	respCtx := newStreamingRespCtx()
+
+	body := []byte(`{"choices":[{"message":{"content":"visit http://127.0.0.1:1 for info"}}]}`)
+	chunk := &policy.StreamBody{Chunk: body, EndOfStream: true}
+	got := p.OnResponseBodyChunk(ctx, respCtx, chunk, nil)
+
+	if got.Body == nil {
+		t.Fatal("expected error body for invalid URL in non-SSE chunk, got nil")
+	}
+	if !strings.Contains(string(got.Body), "URL_GUARDRAIL") {
+		t.Fatalf("expected URL_GUARDRAIL in error body, got: %s", got.Body)
+	}
+}
+
+// ─── OnResponseBodyChunk stream-stop tests ───────────────────────────────────
+
+func sseContentChunk(content string) []byte {
+	quoted, _ := json.Marshal(content)
+	return []byte(`data: {"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":` + string(quoted) + `},"finish_reason":null}]}` + "\n\n")
+}
+
+func newStreamingRespCtx() *policy.ResponseStreamContext {
+	return &policy.ResponseStreamContext{SharedContext: &policy.SharedContext{}}
+}
+
+func newStreamingURLPolicy(timeout int) *URLGuardrailPolicy {
+	return &URLGuardrailPolicy{
+		hasResponseParams: true,
+		responseParams: URLGuardrailPolicyParams{
+			Enabled:           true,
+			StreamingJsonPath: DefaultStreamingJsonPath,
+			Timeout:           timeout,
+		},
+	}
+}
+
+// TestOnResponseBodyChunk_InvalidURL_EmitsErrorAndTerminates verifies that when
+// a chunk contains an invalid URL, OnResponseBodyChunk returns an SSE error
+// event with TerminateStream set so the engine closes the stream cleanly.
+func TestOnResponseBodyChunk_InvalidURL_EmitsErrorAndTerminates(t *testing.T) {
+	p := newStreamingURLPolicy(200)
+	ctx := context.Background()
+	respCtx := newStreamingRespCtx()
+
+	// Chunk with no URL passes through unmodified.
+	plain := &policy.StreamBody{Chunk: sseContentChunk("no urls here")}
+	got := p.OnResponseBodyChunk(ctx, respCtx, plain, nil)
+	if got.Body != nil {
+		t.Fatalf("expected passthrough for chunk with no URL, got %q", got.Body)
+	}
+
+	// Chunk containing an unreachable URL triggers the guardrail.
+	invalid := &policy.StreamBody{Chunk: sseContentChunk("visit http://127.0.0.1:1 for info")}
+	got = p.OnResponseBodyChunk(ctx, respCtx, invalid, nil)
+
+	if got.Body == nil {
+		t.Fatal("expected error body on invalid URL, got nil")
+	}
+	if !got.TerminateStream {
+		t.Fatal("expected TerminateStream=true on invalid URL violation")
+	}
+	if !strings.Contains(string(got.Body), "URL_GUARDRAIL") {
+		t.Fatalf("expected URL_GUARDRAIL in error body, got: %s", got.Body)
+	}
+	// Parse the SSE event and verify guardrail action fields.
+	msg := mustMessageMap(t, []byte(strings.TrimPrefix(strings.TrimSuffix(string(got.Body), "\n\n"), "data: ")))
+	if msg["action"] != "GUARDRAIL_INTERVENED" {
+		t.Fatalf("expected action=GUARDRAIL_INTERVENED, got %#v", msg["action"])
+	}
+	if msg["interveningGuardrail"] != "url-guardrail" {
+		t.Fatalf("expected interveningGuardrail=url-guardrail, got %#v", msg["interveningGuardrail"])
+	}
+}

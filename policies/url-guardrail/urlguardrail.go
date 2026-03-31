@@ -47,7 +47,7 @@ const (
 	sseDone                  = "[DONE]"
 	sseEventPrefix           = "event:"
 	DefaultStreamingJsonPath = "$.choices[0].delta.content"
-	metaKeyAccJsonBody       = "urlguardrail:json_body"
+	metaKeyAccJsonBody = "urlguardrail:json_body"
 )
 
 var (
@@ -58,7 +58,13 @@ var (
 	// way through a URL body that has started past "://" but has no terminating
 	// whitespace yet ("https://example.com/path"). A single regex covers both
 	// cases: https?  optionally followed by  :  and any non-whitespace chars.
-	incompleteURLAtEnd = regexp.MustCompile(`(?:^|[\s])https?(?::[^\s]*)?$`)
+	//
+	// [^\w] (instead of [\s]) is intentional: URLs can appear directly after
+	// non-whitespace punctuation such as backticks, parentheses, or quotes
+	// (e.g. `http://example.com`).  Using [^\w] accepts any non-alphanumeric
+	// predecessor while still rejecting embedded substrings like "webhttps"
+	// where a word character (b) immediately precedes the protocol.
+	incompleteURLAtEnd = regexp.MustCompile(`(?:^|[^\w])https?(?::[^\s]*)?$`)
 )
 
 // URLGuardrailPolicy implements URL validation guardrail
@@ -487,14 +493,15 @@ func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *p
 		return policy.ForwardResponseChunk{}
 	}
 
+	if respCtx.Metadata == nil {
+		respCtx.Metadata = make(map[string]interface{})
+	}
+
 	chunkStr := string(chunk.Chunk)
 
 	if !isSSEChunk(chunkStr) {
 		// Plain JSON via chunked transfer (e.g. OpenAI stream:false with Transfer-Encoding: chunked).
 		// Accumulate all chunks and validate the complete body at end of stream.
-		if respCtx.Metadata == nil {
-			respCtx.Metadata = make(map[string]interface{})
-		}
 		prev, _ := respCtx.Metadata[metaKeyAccJsonBody].(string)
 		full := prev + chunkStr
 		respCtx.Metadata[metaKeyAccJsonBody] = full

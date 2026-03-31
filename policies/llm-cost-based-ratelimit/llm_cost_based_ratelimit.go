@@ -72,15 +72,15 @@ func GetPolicy(
 
 
 // Mode returns the processing mode for this policy.
-// ResponseBodyMode is Buffer so that OnResponseBody is called after llm-cost
-// sets x-llm-cost in SharedContext.Metadata; response headers phase runs before
-// that metadata is populated so cost extraction there would always return 0.
+// ResponseBodyMode is Stream so that OnResponseBodyChunk is called for each chunk,
+// delegating to the advanced-ratelimit instance which reads x-llm-cost from
+// SharedContext.Metadata at end-of-stream (set by the llm-cost system policy).
 func (p *LLMCostRateLimitPolicy) Mode() policy.ProcessingMode {
 	return policy.ProcessingMode{
 		RequestHeaderMode:  policy.HeaderModeProcess,
 		RequestBodyMode:    policy.BodyModeSkip,
 		ResponseHeaderMode: policy.HeaderModeProcess,
-		ResponseBodyMode:   policy.BodyModeBuffer,
+		ResponseBodyMode:   policy.BodyModeStream,
 	}
 }
 
@@ -203,6 +203,53 @@ func (p *LLMCostRateLimitPolicy) OnResponseHeaders(ctx context.Context, respCtx 
 		"route", p.metadata.RouteName,
 		"provider", providerName)
 	return policy.DownstreamResponseHeaderModifications{}
+}
+
+// OnResponseBodyChunk processes each streaming response chunk by delegating to the
+// provider-specific advanced-ratelimit instance. The delegate reads x-llm-cost from
+// SharedContext.Metadata at end-of-stream (set by the llm-cost system policy) and
+// consumes the cost quota. Dollar-denominated headers are set during OnResponseHeaders.
+func (p *LLMCostRateLimitPolicy) OnResponseBodyChunk(
+	ctx context.Context,
+	respCtx *policy.ResponseStreamContext,
+	chunk *policy.StreamBody,
+	params map[string]interface{},
+) policy.ResponseChunkAction {
+	type responseChunkPolicer interface {
+		OnResponseBodyChunk(context.Context, *policy.ResponseStreamContext, *policy.StreamBody, map[string]interface{}) policy.ResponseChunkAction
+	}
+
+	// First, try the delegate pinned during OnRequestHeaders.
+	if delegate, ok := respCtx.Metadata[MetadataKeyDelegate].(policy.Policy); ok {
+		if rl, ok := delegate.(responseChunkPolicer); ok {
+			return rl.OnResponseBodyChunk(ctx, respCtx, chunk, params)
+		}
+		return policy.ResponseChunkAction{}
+	}
+
+	// Fallback: look up by provider name (for cases where OnRequestHeaders didn't run).
+	providerName, ok := respCtx.Metadata[MetadataKeyProviderName].(string)
+	if !ok || providerName == "" {
+		slog.Debug("OnResponseBodyChunk: provider name not found in metadata; skipping",
+			"route", p.metadata.RouteName)
+		return policy.ResponseChunkAction{}
+	}
+
+	if entry, ok := p.delegates.Load(providerName); ok {
+		if de, ok := entry.(*delegateEntry); ok && de.delegate != nil {
+			if rl, ok := de.delegate.(responseChunkPolicer); ok {
+				return rl.OnResponseBodyChunk(ctx, respCtx, chunk, params)
+			}
+		}
+	}
+
+	return policy.ResponseChunkAction{}
+}
+
+// NeedsMoreResponseData returns false because the delegate (advanced-ratelimit) manages
+// all state internally — x-llm-cost metadata is read at end-of-stream from SharedContext.
+func (p *LLMCostRateLimitPolicy) NeedsMoreResponseData(_ []byte) bool {
+	return false
 }
 
 // OnResponseBody processes the response body phase by delegating to the same

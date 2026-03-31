@@ -1031,3 +1031,50 @@ func TestOnRequestBodyAndOnResponseBody(t *testing.T) {
 		t.Fatalf("expected response no-op when response.enabled=false, got %T", respDisabled)
 	}
 }
+
+// ─── OnResponseBodyChunk stream-stop tests ───────────────────────────────────
+
+func newStreamingRespCtx() *policy.ResponseStreamContext {
+	return &policy.ResponseStreamContext{SharedContext: &policy.SharedContext{}}
+}
+
+// TestOnResponseBodyChunk_MaxViolation_EmitsErrorAndTerminates verifies that
+// when the accumulated word count exceeds max mid-stream, OnResponseBodyChunk
+// returns an SSE error event with TerminateStream set so the engine closes the
+// stream cleanly.
+func TestOnResponseBodyChunk_MaxViolation_EmitsErrorAndTerminates(t *testing.T) {
+	p := newStreamingPolicy(1, 3)
+	ctx := context.Background()
+	respCtx := newStreamingRespCtx()
+
+	// First three words (count == max) pass through unmodified.
+	for _, word := range []string{"one", " two", " three"} {
+		chunk := &policy.StreamBody{Chunk: []byte(sseEvent(word))}
+		got := p.OnResponseBodyChunk(ctx, respCtx, chunk, nil)
+		if got.Body != nil {
+			t.Fatalf("word %q: expected passthrough (Body=nil), got %q", word, got.Body)
+		}
+	}
+
+	// Fourth word pushes count to 4, exceeding max=3 — must emit error with TerminateStream.
+	chunk := &policy.StreamBody{Chunk: []byte(sseEvent(" four"))}
+	got := p.OnResponseBodyChunk(ctx, respCtx, chunk, nil)
+
+	if got.Body == nil {
+		t.Fatal("expected error body on max violation, got nil")
+	}
+	if !got.TerminateStream {
+		t.Fatal("expected TerminateStream=true on max violation")
+	}
+	if !strings.Contains(string(got.Body), "WORD_COUNT_GUARDRAIL") {
+		t.Fatalf("expected WORD_COUNT_GUARDRAIL in error body, got: %s", got.Body)
+	}
+	// Parse the SSE event and verify guardrail action fields.
+	msg := mustMessageMap(t, []byte(strings.TrimPrefix(strings.TrimSuffix(string(got.Body), "\n\n"), "data: ")))
+	if msg["action"] != "GUARDRAIL_INTERVENED" {
+		t.Fatalf("expected action=GUARDRAIL_INTERVENED, got %#v", msg["action"])
+	}
+	if msg["interveningGuardrail"] != "word-count-guardrail" {
+		t.Fatalf("expected interveningGuardrail=word-count-guardrail, got %#v", msg["interveningGuardrail"])
+	}
+}
