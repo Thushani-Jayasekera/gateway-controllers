@@ -100,7 +100,6 @@ func GetPolicy(
 	return p, nil
 }
 
-
 func (p *ModelWeightedRoundRobinPolicy) Mode() policy.ProcessingMode {
 	return policy.ProcessingMode{
 		RequestHeaderMode:  policy.HeaderModeProcess,
@@ -363,7 +362,7 @@ func (p *ModelWeightedRoundRobinPolicy) OnRequestHeaders(ctx context.Context, re
 		newPath := p.modifyQueryParamInPath(reqCtx.Path, identifier, selectedModel.Model)
 		if newPath != reqCtx.Path {
 			return policy.UpstreamRequestHeaderModifications{
-				HeadersToSet: map[string]string{":path": newPath},
+				Path: &newPath,
 			}
 		}
 		return policy.UpstreamRequestHeaderModifications{}
@@ -371,7 +370,7 @@ func (p *ModelWeightedRoundRobinPolicy) OnRequestHeaders(ctx context.Context, re
 		newPath := p.modifyPathParamInPath(reqCtx.Path, identifier, selectedModel.Model)
 		if newPath != reqCtx.Path {
 			return policy.UpstreamRequestHeaderModifications{
-				HeadersToSet: map[string]string{":path": newPath},
+				Path: &newPath,
 			}
 		}
 	}

@@ -226,8 +226,8 @@ func TestModelWeightedRoundRobinPolicy_OnRequestHeaders_QueryAndPathMutation(t *
 	}
 	queryAction := pQuery.OnRequestHeaders(context.Background(), queryCtx, nil)
 	queryMods := mustWeightedRequestHeaderMods(t, queryAction)
-	if got := queryMods.HeadersToSet[":path"]; !strings.Contains(got, "model=gpt-4") {
-		t.Fatalf("expected query path to include new model, got %q", got)
+	if queryMods.Path == nil || !strings.Contains(*queryMods.Path, "model=gpt-4") {
+		t.Fatalf("expected query path to include new model, got %v", queryMods.Path)
 	}
 
 	pPath := mustGetWeightedPolicy(t, map[string]interface{}{
@@ -243,8 +243,8 @@ func TestModelWeightedRoundRobinPolicy_OnRequestHeaders_QueryAndPathMutation(t *
 	}
 	pathAction := pPath.OnRequestHeaders(context.Background(), pathCtx, nil)
 	pathMods := mustWeightedRequestHeaderMods(t, pathAction)
-	if got := pathMods.HeadersToSet[":path"]; !strings.Contains(got, "/models/gpt-4/") {
-		t.Fatalf("expected path to include new model, got %q", got)
+	if pathMods.Path == nil || !strings.Contains(*pathMods.Path, "/models/gpt-4/") {
+		t.Fatalf("expected path to include new model, got %v", pathMods.Path)
 	}
 }
 
