@@ -596,11 +596,11 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 			if !rp.Invert {
 				if count < rp.Min {
 					reason := fmt.Sprintf("sentence count %d is below minimum of %d sentences", count, rp.Min)
-					return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+					return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 				}
 			} else if count >= rp.Min && count <= rp.Max {
 				reason := fmt.Sprintf("sentence count %d is within the excluded range %d-%d sentences", count, rp.Min, rp.Max)
-				return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+				return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 			}
 			return policy.ForwardResponseChunk{}
 		}
@@ -633,13 +633,13 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 			slog.Debug("SentenceCountGuardrail: max exceeded",
 				"count", count, "max", rp.Max, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("sentence count %d exceeded maximum of %d sentences", count, rp.Max)
-			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 		}
 		if isDone && count < rp.Min {
 			slog.Debug("SentenceCountGuardrail: below min at stream end",
 				"count", count, "min", rp.Min, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("sentence count %d is below minimum of %d sentences", count, rp.Min)
-			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 		}
 		return policy.ForwardResponseChunk{}
 	}
@@ -650,7 +650,7 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 			slog.Debug("SentenceCountGuardrail: invert violation at stream end",
 				"count", count, "min", rp.Min, "max", rp.Max, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("sentence count %d is within the excluded range %d-%d sentences", count, rp.Min, rp.Max)
-			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 		}
 	}
 	return policy.ForwardResponseChunk{}

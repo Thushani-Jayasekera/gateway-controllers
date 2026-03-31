@@ -540,7 +540,7 @@ func (p *URLGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *p
 	if len(invalidURLs) > 0 {
 		slog.Debug("URLGuardrail: streaming validation failed",
 			"invalidURLCount", len(invalidURLs), "totalURLCount", len(urls))
-		return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(invalidURLs, p.responseParams.ShowAssessment), TerminateStream: true}
+		return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(invalidURLs, p.responseParams.ShowAssessment)}
 	}
 
 	return policy.ForwardResponseChunk{} // all URLs valid — pass through

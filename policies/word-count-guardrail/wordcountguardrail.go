@@ -707,11 +707,11 @@ func (p *WordCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, resp
 			if !rp.Invert {
 				if count < rp.Min {
 					reason := fmt.Sprintf("word count %d is below minimum of %d words", count, rp.Min)
-					return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+					return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 				}
 			} else if count >= rp.Min && count <= rp.Max {
 				reason := fmt.Sprintf("word count %d is within the excluded range %d-%d words", count, rp.Min, rp.Max)
-				return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+				return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 			}
 			return policy.ForwardResponseChunk{}
 		}
@@ -744,13 +744,13 @@ func (p *WordCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, resp
 			slog.Debug("WordCountGuardrail: max exceeded",
 				"count", count, "max", rp.Max, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("word count %d exceeded maximum of %d words", count, rp.Max)
-			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 		}
 		if isDone && count < rp.Min {
 			slog.Debug("WordCountGuardrail: below min at stream end",
 				"count", count, "min", rp.Min, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("word count %d is below minimum of %d words", count, rp.Min)
-			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp)}
 		}
 		return policy.ForwardResponseChunk{}
 	}

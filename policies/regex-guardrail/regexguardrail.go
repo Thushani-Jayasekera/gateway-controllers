@@ -391,7 +391,7 @@ func (p *RegexGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx 
 	if violated {
 		slog.Debug("RegexGuardrail: streaming validation failed",
 			"regex", rp.Regex, "invert", rp.Invert, "chunkIndex", chunk.Index)
-		return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(rp), TerminateStream: true}
+		return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(rp)}
 	}
 
 	return policy.ForwardResponseChunk{}

@@ -453,7 +453,7 @@ func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 		reason := fmt.Sprintf("content length %d bytes is outside the allowed range %d-%d bytes", running, rp.Min, rp.Max)
 		slog.Debug("ContentLengthGuardrail: streaming max violation",
 			"runningBytes", running, "max", rp.Max)
-		return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max), TerminateStream: true}
+		return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max)}
 	}
 
 	// At end of stream: perform the complete min/max/invert validation.
@@ -472,7 +472,7 @@ func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 			}
 			slog.Debug("ContentLengthGuardrail: streaming validation failed",
 				"runningBytes", running, "min", rp.Min, "max", rp.Max, "invert", rp.Invert)
-			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max)}
 		}
 	}
 
