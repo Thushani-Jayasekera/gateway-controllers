@@ -214,9 +214,9 @@ func (p *LLMCostRateLimitPolicy) OnResponseBodyChunk(
 	respCtx *policy.ResponseStreamContext,
 	chunk *policy.StreamBody,
 	params map[string]interface{},
-) policy.ResponseChunkAction {
+) policy.StreamingResponseAction {
 	type responseChunkPolicer interface {
-		OnResponseBodyChunk(context.Context, *policy.ResponseStreamContext, *policy.StreamBody, map[string]interface{}) policy.ResponseChunkAction
+		OnResponseBodyChunk(context.Context, *policy.ResponseStreamContext, *policy.StreamBody, map[string]interface{}) policy.StreamingResponseAction
 	}
 
 	// First, try the delegate pinned during OnRequestHeaders.
@@ -224,7 +224,7 @@ func (p *LLMCostRateLimitPolicy) OnResponseBodyChunk(
 		if rl, ok := delegate.(responseChunkPolicer); ok {
 			return rl.OnResponseBodyChunk(ctx, respCtx, chunk, params)
 		}
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	// Fallback: look up by provider name (for cases where OnRequestHeaders didn't run).
@@ -232,7 +232,7 @@ func (p *LLMCostRateLimitPolicy) OnResponseBodyChunk(
 	if !ok || providerName == "" {
 		slog.Debug("OnResponseBodyChunk: provider name not found in metadata; skipping",
 			"route", p.metadata.RouteName)
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	if entry, ok := p.delegates.Load(providerName); ok {
@@ -243,7 +243,7 @@ func (p *LLMCostRateLimitPolicy) OnResponseBodyChunk(
 		}
 	}
 
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }
 
 // NeedsMoreResponseData returns false because the delegate (advanced-ratelimit) manages

@@ -2173,7 +2173,7 @@ func (p *RateLimitPolicy) OnResponseBodyChunk(
 	respCtx *policy.ResponseStreamContext,
 	chunk *policy.StreamBody,
 	_ map[string]interface{},
-) policy.ResponseChunkAction {
+) policy.StreamingResponseAction {
 	state := p.getOrInitStreamState(respCtx.Metadata)
 
 	for i := range p.quotas {
@@ -2203,7 +2203,7 @@ func (p *RateLimitPolicy) OnResponseBodyChunk(
 		p.finalizeAndConsumeStreamingCosts(ctx, respCtx, state)
 	}
 
-	return policy.ResponseChunkAction{} // passthrough — do not modify the chunk
+	return policy.ForwardResponseChunk{} // passthrough — do not modify the chunk
 }
 
 // NeedsMoreResponseData always returns false.

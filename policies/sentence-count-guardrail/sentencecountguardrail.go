@@ -565,12 +565,12 @@ func (p *SentenceCountGuardrailPolicy) NeedsMoreResponseData(accumulated []byte)
 // OnResponseBodyChunk implements StreamingResponsePolicy.
 // Receives flushed batches from the kernel accumulator and validates them.
 // ctx.Metadata tracks the full accumulated text across windows for accuracy.
-func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.StreamingResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	if chunk == nil || len(chunk.Chunk) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	chunkStr := string(chunk.Chunk)
 	if respCtx.Metadata == nil {
@@ -583,7 +583,7 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 		full := prev + chunkStr
 		respCtx.Metadata[metaKeyAccJsonBody] = full
 		if !chunk.EndOfStream {
-			return policy.ResponseChunkAction{}
+			return policy.ForwardResponseChunk{}
 		}
 		// An empty or whitespace-only EndOfStream chunk is a bare sentinel that arrives after
 		// the SSE [DONE] event (common in many streaming frameworks). In this case all content
@@ -596,19 +596,19 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 			if !rp.Invert {
 				if count < rp.Min {
 					reason := fmt.Sprintf("sentence count %d is below minimum of %d sentences", count, rp.Min)
-					return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+					return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
 				}
 			} else if count >= rp.Min && count <= rp.Max {
 				reason := fmt.Sprintf("sentence count %d is within the excluded range %d-%d sentences", count, rp.Min, rp.Max)
-				return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+				return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
 			}
-			return policy.ResponseChunkAction{}
+			return policy.ForwardResponseChunk{}
 		}
 		result := p.validatePayload([]byte(full), p.responseParams, true)
 		if mod, ok := result.(policy.DownstreamResponseModifications); ok && mod.StatusCode != nil {
-			return policy.ResponseChunkAction{Body: mod.Body}
+			return policy.TerminateResponseChunk{Body: mod.Body}
 		}
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	rp := p.responseParams
@@ -633,15 +633,15 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 			slog.Debug("SentenceCountGuardrail: max exceeded",
 				"count", count, "max", rp.Max, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("sentence count %d exceeded maximum of %d sentences", count, rp.Max)
-			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
 		}
 		if isDone && count < rp.Min {
 			slog.Debug("SentenceCountGuardrail: below min at stream end",
 				"count", count, "min", rp.Min, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("sentence count %d is below minimum of %d sentences", count, rp.Min)
-			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
 		}
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	// Invert mode: at [DONE], check if count falls within the excluded range.
@@ -650,10 +650,10 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 			slog.Debug("SentenceCountGuardrail: invert violation at stream end",
 				"count", count, "min", rp.Min, "max", rp.Max, "chunkIndex", chunk.Index)
 			reason := fmt.Sprintf("sentence count %d is within the excluded range %d-%d sentences", count, rp.Min, rp.Max)
-			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp), TerminateStream: true}
 		}
 	}
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }
 
 // isSSEChunk reports whether s looks like SSE data (has at least one "data: " or "event:" line).

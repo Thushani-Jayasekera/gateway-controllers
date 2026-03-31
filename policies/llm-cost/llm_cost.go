@@ -209,7 +209,7 @@ func (p *LLMCostPolicy) OnResponseBodyChunk(
 	respCtx *policy.ResponseStreamContext,
 	chunk *policy.StreamBody,
 	_ map[string]interface{},
-) policy.ResponseChunkAction {
+) policy.StreamingResponseAction {
 	if len(chunk.Chunk) > 0 {
 		if respCtx.Metadata == nil {
 			respCtx.Metadata = make(map[string]interface{})
@@ -219,7 +219,7 @@ func (p *LLMCostPolicy) OnResponseBodyChunk(
 	}
 
 	if !chunk.EndOfStream {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	// EOS: extract accumulated bytes and clean up the temporary key.
@@ -235,7 +235,7 @@ func (p *LLMCostPolicy) OnResponseBodyChunk(
 	}
 
 	p.computeAndSetStreamingCost(respCtx.SharedContext, accumulated, requestBody)
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }
 
 // computeAndSetStreamingCost parses the accumulated response bytes, calculates the

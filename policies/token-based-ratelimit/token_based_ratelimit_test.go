@@ -41,9 +41,9 @@ func (s *stubChunkPolicer) OnResponseHeaders(context.Context, *policy.ResponseHe
 func (s *stubChunkPolicer) OnResponseBody(context.Context, *policy.ResponseContext, map[string]interface{}) policy.ResponseAction {
 	return nil
 }
-func (s *stubChunkPolicer) OnResponseBodyChunk(_ context.Context, _ *policy.ResponseStreamContext, _ *policy.StreamBody, _ map[string]interface{}) policy.ResponseChunkAction {
+func (s *stubChunkPolicer) OnResponseBodyChunk(_ context.Context, _ *policy.ResponseStreamContext, _ *policy.StreamBody, _ map[string]interface{}) policy.StreamingResponseAction {
 	s.chunkCalls++
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }
 func (s *stubChunkPolicer) NeedsMoreResponseData(_ []byte) bool { return false }
 
@@ -436,8 +436,8 @@ func TestTokenBasedRateLimitPolicy_OnResponseBodyChunk_NoProvider(t *testing.T) 
 	chunk := &policy.StreamBody{Chunk: []byte("data: {}"), EndOfStream: true}
 
 	action := p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
-	if !reflect.DeepEqual(action, policy.ResponseChunkAction{}) {
-		t.Errorf("expected empty ResponseChunkAction, got %v", action)
+	if !reflect.DeepEqual(action, policy.ForwardResponseChunk{}) {
+		t.Errorf("expected empty ForwardResponseChunk, got %v", action)
 	}
 }
 
@@ -449,8 +449,8 @@ func TestTokenBasedRateLimitPolicy_OnResponseBodyChunk_NoDelegateFound(t *testin
 	chunk := &policy.StreamBody{Chunk: []byte("data: {}"), EndOfStream: true}
 
 	action := p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
-	if !reflect.DeepEqual(action, policy.ResponseChunkAction{}) {
-		t.Errorf("expected empty ResponseChunkAction, got %v", action)
+	if !reflect.DeepEqual(action, policy.ForwardResponseChunk{}) {
+		t.Errorf("expected empty ForwardResponseChunk, got %v", action)
 	}
 }
 

@@ -401,12 +401,12 @@ func (p *ContentLengthGuardrailPolicy) NeedsMoreResponseData(accumulated []byte)
 // OnResponseBodyChunk implements StreamingResponsePolicy.
 // Maintains a running delta.content byte count across chunks and validates
 // the content length against the configured min/max thresholds.
-func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.ResponseChunkAction {
+func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, respCtx *policy.ResponseStreamContext, chunk *policy.StreamBody, params map[string]interface{}) policy.StreamingResponseAction {
 	if !p.hasResponseParams || !p.responseParams.Enabled {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 	if chunk == nil || len(chunk.Chunk) == 0 {
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	if respCtx.Metadata == nil {
@@ -422,13 +422,13 @@ func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 		full := prev + chunkStr
 		respCtx.Metadata[metaKeyAccJsonBody] = full
 		if !chunk.EndOfStream {
-			return policy.ResponseChunkAction{}
+			return policy.ForwardResponseChunk{}
 		}
 		result := p.validatePayload([]byte(full), p.responseParams, true)
 		if mod, ok := result.(policy.DownstreamResponseModifications); ok && mod.StatusCode != nil {
-			return policy.ResponseChunkAction{Body: mod.Body}
+			return policy.TerminateResponseChunk{Body: mod.Body}
 		}
-		return policy.ResponseChunkAction{}
+		return policy.ForwardResponseChunk{}
 	}
 
 	rp := p.responseParams
@@ -453,7 +453,7 @@ func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 		reason := fmt.Sprintf("content length %d bytes is outside the allowed range %d-%d bytes", running, rp.Min, rp.Max)
 		slog.Debug("ContentLengthGuardrail: streaming max violation",
 			"runningBytes", running, "max", rp.Max)
-		return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max), TerminateStream: true}
+		return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max), TerminateStream: true}
 	}
 
 	// At end of stream: perform the complete min/max/invert validation.
@@ -472,11 +472,11 @@ func (p *ContentLengthGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 			}
 			slog.Debug("ContentLengthGuardrail: streaming validation failed",
 				"runningBytes", running, "min", rp.Min, "max", rp.Max, "invert", rp.Invert)
-			return policy.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max), TerminateStream: true}
+			return policy.TerminateResponseChunk{Body: p.buildSSEErrorEvent(reason, rp.ShowAssessment, rp.Min, rp.Max), TerminateStream: true}
 		}
 	}
 
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }
 
 // isSSEChunk reports whether s looks like SSE data (has at least one "data: " or "event:" line).

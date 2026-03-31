@@ -443,9 +443,9 @@ func (s *stubCostChunkPolicer) OnResponseHeaders(context.Context, *policy.Respon
 func (s *stubCostChunkPolicer) OnResponseBody(context.Context, *policy.ResponseContext, map[string]interface{}) policy.ResponseAction {
 	return nil
 }
-func (s *stubCostChunkPolicer) OnResponseBodyChunk(_ context.Context, _ *policy.ResponseStreamContext, _ *policy.StreamBody, _ map[string]interface{}) policy.ResponseChunkAction {
+func (s *stubCostChunkPolicer) OnResponseBodyChunk(_ context.Context, _ *policy.ResponseStreamContext, _ *policy.StreamBody, _ map[string]interface{}) policy.StreamingResponseAction {
 	s.chunkCalls++
-	return policy.ResponseChunkAction{}
+	return policy.ForwardResponseChunk{}
 }
 func (s *stubCostChunkPolicer) NeedsMoreResponseData(_ []byte) bool { return false }
 
@@ -491,8 +491,8 @@ func TestLLMCostRateLimitPolicy_OnResponseBodyChunk_NoProvider(t *testing.T) {
 	chunk := &policy.StreamBody{Chunk: []byte("data: {}"), EndOfStream: true}
 
 	action := p.OnResponseBodyChunk(context.Background(), respCtx, chunk, nil)
-	if !reflect.DeepEqual(action, policy.ResponseChunkAction{}) {
-		t.Errorf("expected empty ResponseChunkAction, got %v", action)
+	if !reflect.DeepEqual(action, policy.ForwardResponseChunk{}) {
+		t.Errorf("expected empty ForwardResponseChunk, got %v", action)
 	}
 }
 
