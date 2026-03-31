@@ -56,10 +56,32 @@ func (c *AnthropicCalculator) Normalize(responseBody []byte, requestBody []byte)
 		return Usage{}, err
 	}
 
-	// If usage is empty at top level but present inside message envelope, use that.
-	if resp.Usage.InputTokens == 0 && resp.Usage.OutputTokens == 0 && resp.Message != nil {
-		if resp.Message.Usage.InputTokens > 0 || resp.Message.Usage.OutputTokens > 0 {
-			resp.Usage = resp.Message.Usage
+	// Anthropic SSE splits usage across events: message_start carries input_tokens
+	// inside message.usage; message_delta carries output_tokens at the top-level
+	// usage. After mergeSSEEvents both locations may be populated. Hoist any
+	// missing fields from the message envelope so the merged usage is complete.
+	if resp.Message != nil {
+		msg := resp.Message.Usage
+		if resp.Usage.InputTokens == 0 {
+			resp.Usage.InputTokens = msg.InputTokens
+		}
+		if resp.Usage.OutputTokens == 0 {
+			resp.Usage.OutputTokens = msg.OutputTokens
+		}
+		if resp.Usage.CacheCreationInputTokens == 0 {
+			resp.Usage.CacheCreationInputTokens = msg.CacheCreationInputTokens
+		}
+		if resp.Usage.CacheReadInputTokens == 0 {
+			resp.Usage.CacheReadInputTokens = msg.CacheReadInputTokens
+		}
+		if resp.Usage.CacheCreation == nil {
+			resp.Usage.CacheCreation = msg.CacheCreation
+		}
+		if resp.Usage.ServerToolUse == nil {
+			resp.Usage.ServerToolUse = msg.ServerToolUse
+		}
+		if resp.Usage.InferenceGeo == "" {
+			resp.Usage.InferenceGeo = msg.InferenceGeo
 		}
 	}
 

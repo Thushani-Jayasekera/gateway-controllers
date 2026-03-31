@@ -234,16 +234,21 @@ func (p *LLMCostPolicy) OnResponseBodyChunk(
 		requestBody = respCtx.RequestBody.Content
 	}
 
-	p.computeAndSetStreamingCost(respCtx.SharedContext, accumulated, requestBody)
-	return policy.ForwardResponseChunk{}
+	cost := p.computeAndSetStreamingCost(respCtx.SharedContext, accumulated, requestBody)
+	return policy.ForwardResponseChunk{
+		AnalyticsMetadata: map[string]any{
+			MetadataLLMCost: cost,
+		},
+	}
 }
 
 // computeAndSetStreamingCost parses the accumulated response bytes, calculates the
-// LLM cost, and writes x-llm-cost / x-llm-cost-status into SharedContext.Metadata.
-func (p *LLMCostPolicy) computeAndSetStreamingCost(sharedCtx *policy.SharedContext, body, requestBody []byte) {
+// LLM cost, writes x-llm-cost / x-llm-cost-status into SharedContext.Metadata, and
+// returns the calculated cost in USD (0.0 on any error).
+func (p *LLMCostPolicy) computeAndSetStreamingCost(sharedCtx *policy.SharedContext, body, requestBody []byte) float64 {
 	if sharedCtx == nil {
 		slog.Warn("llm-cost: SharedContext is nil in streaming mode, cannot set cost metadata")
-		return
+		return 0.0
 	}
 	if sharedCtx.Metadata == nil {
 		sharedCtx.Metadata = make(map[string]interface{})
@@ -257,7 +262,7 @@ func (p *LLMCostPolicy) computeAndSetStreamingCost(sharedCtx *policy.SharedConte
 	if len(body) == 0 {
 		slog.Warn("llm-cost: empty accumulated stream body, skipping cost calculation")
 		setMeta(0.0, costStatusNotCalculated)
-		return
+		return 0.0
 	}
 
 	responseBody := body
@@ -266,7 +271,7 @@ func (p *LLMCostPolicy) computeAndSetStreamingCost(sharedCtx *policy.SharedConte
 		if err != nil {
 			slog.Warn("llm-cost: failed to merge SSE events in streaming mode", "error", err)
 			setMeta(0.0, costStatusNotCalculated)
-			return
+			return 0.0
 		}
 		responseBody = merged
 	}
@@ -281,7 +286,7 @@ func (p *LLMCostPolicy) computeAndSetStreamingCost(sharedCtx *policy.SharedConte
 	if err := json.Unmarshal(responseBody, &probe); err != nil {
 		slog.Warn("llm-cost: could not parse streaming response body", "error", err)
 		setMeta(0.0, costStatusNotCalculated)
-		return
+		return 0.0
 	}
 	modelName := probe.Model
 	if modelName == "" {
@@ -293,28 +298,28 @@ func (p *LLMCostPolicy) computeAndSetStreamingCost(sharedCtx *policy.SharedConte
 	if modelName == "" {
 		slog.Warn("llm-cost: no model name found in streaming response body")
 		setMeta(0.0, costStatusNotCalculated)
-		return
+		return 0.0
 	}
 
 	pricing, found := lookupPricing(p.pricingMap, modelName)
 	if !found {
 		slog.Warn("llm-cost: no pricing entry for model, setting cost to 0", "model", modelName)
 		setMeta(0.0, costStatusNotCalculated)
-		return
+		return 0.0
 	}
 
 	calc := selectCalculator(pricing.Provider)
 	if calc == nil {
 		slog.Warn("llm-cost: unsupported provider in streaming mode", "provider", pricing.Provider, "model", modelName)
 		setMeta(0.0, costStatusNotCalculated)
-		return
+		return 0.0
 	}
 
 	usage, err := calc.Normalize(responseBody, requestBody)
 	if err != nil {
 		slog.Warn("llm-cost: failed to normalize streaming usage", "model", modelName, "error", err)
 		setMeta(0.0, costStatusNotCalculated)
-		return
+		return 0.0
 	}
 
 	baseCost := genericCalculateCost(usage, pricing)
@@ -329,6 +334,7 @@ func (p *LLMCostPolicy) computeAndSetStreamingCost(sharedCtx *policy.SharedConte
 	)
 
 	setMeta(finalCost, costStatusCalculated)
+	return finalCost
 }
 
 // isSSEContent reports whether the body looks like buffered SSE data (has at
@@ -396,6 +402,21 @@ func mergeSSEEvents(body []byte) ([]byte, error) {
 	}
 
 	return json.Marshal(merged)
+}
+
+// setStreamCostMetadata writes x-llm-cost and x-llm-cost-status into the streaming
+// response context metadata and returns a ForwardResponseChunk with AnalyticsMetadata set.
+func setStreamCostMetadata(respCtx *policy.ResponseStreamContext, costUSD float64, status string) policy.StreamingResponseAction {
+	if respCtx.Metadata == nil {
+		respCtx.Metadata = make(map[string]interface{})
+	}
+	respCtx.Metadata[MetadataLLMCost] = fmt.Sprintf("%.10f", costUSD)
+	respCtx.Metadata[MetadataLLMCostStatus] = status
+	return policy.ForwardResponseChunk{
+		AnalyticsMetadata: map[string]any{
+			MetadataLLMCost: costUSD,
+		},
+	}
 }
 
 // setCostMetadata writes x-llm-cost and x-llm-cost-status into SharedContext.Metadata
